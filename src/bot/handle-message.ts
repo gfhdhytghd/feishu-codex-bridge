@@ -451,6 +451,13 @@ export function settleOrdinaryTurnRender(
   }
 }
 
+/** Failure feedback includes unprocessed follow-ups; they must never disappear
+ * behind an error referring only to the original message. */
+function runFailureMessage(err: unknown, dropped: number): string {
+  const error = `❌ ${err instanceof Error ? err.message : String(err)}`;
+  return dropped > 0 ? `${error}\n\n⚠️ ${dropped} 条排队消息未执行，请重发。` : error;
+}
+
 interface ActiveState {
   /** unset only during the brief "reserved, still resolving the thread" window */
   thread?: AgentThread;
@@ -1234,8 +1241,6 @@ export function createOrchestrator(
     project: Project | undefined,
     perm: TurnPerm,
   ): Promise<void> {
-    // Capture title material before ingestContext adds sender/quote/file blocks.
-    const titleSource = sessionTitleSourceFromMessage(msg, text);
     // Mid-turn: steer (引导) or queue (排队).
     const existing = active.get(sessionKey);
     if (existing) {
@@ -1277,14 +1282,10 @@ export function createOrchestrator(
           }
         }
       }
-      cur.queue.push({
-        input: { text: woven, images },
-        titleSource,
-        requesterOpenId: msg.senderId,
-        requestedAt: msg.createTime || Date.now(),
-        summary: stripFileTokens(text).slice(0, 80) || undefined,
-      });
-      log.info('intake', 'queued', { depth: cur.queue.length });
+      // steer() awaited an RPC: the previous run may have ended, or a new
+      // run/goal may now own this key. Re-enter the synchronous reservation
+      // path so the input is queued on the current owner or starts a new run.
+      startReservedRun(msg, woven, sessionKey, flat, project, perm, images, true, text);
       return;
     }
 
@@ -1528,11 +1529,12 @@ export function createOrchestrator(
         if (goal) await launchGoalRun(launchOpts);
         else await launchRun(launchOpts, reaction);
       } catch (err) {
-        active.delete(sessionKey); // release the reservation so the session isn't wedged
+        if (active.get(sessionKey) === reserved) active.delete(sessionKey);
+        const dropped = reserved.queue.splice(0).length;
         reaction?.done();
         log.fail('intake', err);
         await channel
-          .send(msg.chatId, { markdown: `❌ ${err instanceof Error ? err.message : String(err)}` }, { replyTo: msg.messageId, replyInThread: !flat })
+          .send(msg.chatId, { markdown: runFailureMessage(err, dropped) }, { replyTo: msg.messageId, replyInThread: !flat })
           .catch(() => undefined);
       }
     });
@@ -4095,6 +4097,7 @@ export function createOrchestrator(
     // tracks the latest run card key so the finally can clear runsByCard even
     // if the stream producer throws mid-turn (avoids leaking a stale stop target)
     let curCardKey: string | undefined;
+    let disposeInterrupt: (() => void) | undefined;
     // intake durations ride the FIRST turn's stream.timing line only (M-1)
     let intake = opts.timing;
     let firstRec = opts.firstRec;
@@ -4242,6 +4245,7 @@ export function createOrchestrator(
           abort: (tid) => void opts.thread.abort(tid).catch(() => undefined),
           forceStop: resolveStop,
         });
+        disposeInterrupt = stopper.dispose;
         state.interrupt = stopper.interrupt;
         const idleMs = currentIdleMs();
         const guarded = withIdleTimeout(
@@ -4301,8 +4305,10 @@ export function createOrchestrator(
           // typewriter (cardElement.content), structure → whole-card update.
           stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID);
         }
+        state.run = undefined; // completion-card I/O must queue, never steer into a finished turn
         const doneAt = Date.now(); // codex stopped emitting / loop ended
         stopper.dispose(); // 事件流已收尾：撤掉 ⏹ 的 5s 强停兜底定时器
+        disposeInterrupt = undefined;
         await stream.drain(); // flush the last coalesced frame before terminal
         state.interrupt = undefined; // turn done; nothing left to interrupt
         const interrupted = stopper.interrupted();
@@ -4451,12 +4457,24 @@ export function createOrchestrator(
         activateQueuedTurn(state, currentTurn);
       }
     } catch (err) {
+      // Detach before any await: new messages must not join a failed consumer.
+      if (active.get(activeKey) === state) active.delete(activeKey);
+      const dropped = state.queue.splice(0).length;
+      disposeInterrupt?.();
+      state.run = undefined;
+      state.interrupt = undefined;
+      // A stream/card failure can leave an agent turn running. Retire that
+      // client before the next message resumes the persisted session.
+      if (topicThreadId && sessions.get(topicThreadId) === opts.thread) sessions.delete(topicThreadId);
+      await opts.thread.close().catch(() => undefined);
       log.fail('intake', err);
       await channel
-        .send(opts.chatId, { markdown: `❌ ${err instanceof Error ? err.message : String(err)}` }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
-        .catch(() => undefined);
+        .send(opts.chatId, { markdown: runFailureMessage(err, dropped) }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
+        .catch((sendError) => log.fail('intake', sendError, { phase: 'run-failure-feedback', dropped }));
     } finally {
-      active.delete(activeKey);
+      // A replacement run may have reserved the key while failure feedback
+      // was in flight. Never delete another run's reservation.
+      if (active.get(activeKey) === state) active.delete(activeKey);
       if (curCardKey) {
         runsByCard.delete(curCardKey);
         completionReminderRefreshers.delete(curCardKey);
