@@ -1,5 +1,5 @@
 import { realpathSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { log } from '../../core/logger';
 import type {
   AgentBackend,
@@ -83,12 +83,26 @@ export function sandboxParams(
       '「项目内只读 / 项目内读写」靠操作系统沙箱把读写锁进项目文件夹，目前只有 macOS 与原生 Windows 能强制执行。当前平台（Linux / WSL 只挡写、不限制读取，无法保证不泄露隐私）已拒绝启动（绝不降级为完全访问）。请改用「完全访问」、把 Codex 跑进容器/隔离环境，或在 macOS / Windows 上运行。',
     );
   }
-  // Seatbelt must read both the launcher directory and its resolved runtime
-  // directory before exec. Exact-file rules alone fail with Homebrew symlinks.
+  // Custom launchers only receive exact-file access: their parent may be HOME.
+  // Homebrew's known installation layout needs directory reads for Seatbelt
+  // re-exec. Validate canonical parents before allowing that narrow exception.
   const runtimeReads: Record<string, 'read'> = {};
   if (process.platform === 'darwin' && runtimeBin) {
-    runtimeReads[dirname(runtimeBin)] = 'read';
-    runtimeReads[dirname(realpathSync(runtimeBin))] = 'read';
+    const launcher = resolve(runtimeBin);
+    const runtime = realpathSync(launcher);
+    runtimeReads[launcher] = 'read';
+    runtimeReads[runtime] = 'read';
+    const launcherDir = realpathSync(dirname(launcher));
+    for (const prefix of ['/opt/homebrew', '/usr/local']) {
+      if (dirname(launcher) !== `${prefix}/bin` || launcherDir !== `${prefix}/bin`) continue;
+      // Canonical runtime must stay inside the codex package, including after
+      // resolving symlinks. Never authorize an arbitrary package/parent folder.
+      const suffix = runtime.slice(prefix.length);
+      if (!runtime.startsWith(`${prefix}/`) ||
+          !/^\/(?:Caskroom|Cellar)\/codex\/[0-9][A-Za-z0-9._+-]*\/(?:bin\/)?codex(?:-[A-Za-z0-9._+-]+)?$/.test(suffix)) continue;
+      runtimeReads[launcherDir] = 'read';
+      runtimeReads[dirname(runtime)] = 'read';
+    }
   }
   return {
     config: {
