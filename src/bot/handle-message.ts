@@ -1515,6 +1515,7 @@ export function createOrchestrator(
           firstText,
           images,
           knownThreadId: sessionKey,
+          cwd: project?.cwd ?? prior?.cwd ?? fallbackCwd,
           summary: stripFileTokens(summaryText ?? text).slice(0, 80) || '(本轮任务)',
           requesterOpenId: msg.senderId,
           requestedAt: msg.createTime || tIntake,
@@ -3861,6 +3862,15 @@ export function createOrchestrator(
     await sendCompletionReminderReply({ channel, cfg, dedupe: completionReminderSent }, input);
   }
 
+  // Image delivery follows the current project tier, including admin/guest split.
+  async function uploadRunImages(opts: LaunchOpts, sources: string[], requesterOpenId: string | undefined): Promise<Map<string, string>> {
+    const project = await getProjectByChatId(opts.chatId);
+    const rec = opts.knownThreadId ? await getSession(opts.knownThreadId) : undefined;
+    const cwd = project?.cwd ?? opts.cwd ?? rec?.cwd ?? fallbackCwd;
+    const mode = turnPerm(project, requesterOpenId ?? '').mode ?? 'full';
+    return uploadOutboundImages(channel, sources, cwd, mode);
+  }
+
   interface LaunchOpts {
     chatId: string;
     replyTo: string;
@@ -4174,7 +4184,7 @@ export function createOrchestrator(
         // ⏹/⚙️ ride whole-card updates — both on one card_id (see RunCardStream).
         const stream = queuedCard?.stream ?? new RunCardStream();
         const liveImages = new StreamingImages(
-          (sources) => uploadOutboundImages(channel, sources, opts.cwd ?? fallbackCwd),
+          (sources) => uploadRunImages(opts, sources, state.requesterOpenId),
           () => stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID),
         );
         rc.images = liveImages.images;
@@ -4367,7 +4377,7 @@ export function createOrchestrator(
         const { fences } = extractCardFences(answerText);
         const imgSources = imageSources(answerText);
         if (imgSources.length > 0) {
-          rc.images = await uploadOutboundImages(channel, imgSources, opts.cwd ?? fallbackCwd);
+          rc.images = await uploadRunImages(opts, imgSources, state.requesterOpenId);
         }
 
         // terminal whole-card update: final render with streaming off (clears the
@@ -4655,7 +4665,7 @@ export function createOrchestrator(
       if (ctx.stream) return;
       const stream = new RunCardStream();
       const liveImages = new StreamingImages(
-        (sources) => uploadOutboundImages(channel, sources, opts.cwd ?? fallbackCwd),
+        (sources) => uploadRunImages(opts, sources, state.requesterOpenId),
         () => stream.streamCoalesced(channel, buildRunCard(ctx.rc), ANSWER_EID),
       );
       ctx.rc.images = liveImages.images;
