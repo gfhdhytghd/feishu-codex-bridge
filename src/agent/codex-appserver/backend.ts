@@ -278,6 +278,7 @@ class CodexThread implements AgentThread {
     readonly sessionId: string,
     private model: string | undefined,
     private effort: ReasoningEffort | undefined,
+    private fastMode?: boolean,
   ) {}
 
   runStreamed(input: AgentInput, turn?: TurnOptions): AgentRun {
@@ -286,6 +287,7 @@ class CodexThread implements AgentThread {
     // Per-turn overrides persist for subsequent turns (matches turn/start semantics).
     if (turn?.model) this.model = turn.model;
     if (turn?.effort) this.effort = turn.effort;
+    if (turn?.fastMode !== undefined) this.fastMode = turn.fastMode;
     // Liveness clock for the idle watchdog: refreshed on EVERY raw notification
     // below (even ones mapNotification drops, like command output deltas), so a
     // long-running shell command doesn't read as "wedged".
@@ -296,6 +298,7 @@ class CodexThread implements AgentThread {
     };
     if (self.model) params.model = self.model;
     if (self.effort) params.effort = self.effort;
+    if (self.fastMode !== undefined) params.serviceTier = self.fastMode ? 'fast' : null;
 
     // Fire turn/start NOW — at runStreamed() call time, NOT lazily on the first
     // next() — so model inference runs in parallel with the caller's card setup
@@ -651,8 +654,9 @@ export class CodexAppServerBackend implements AgentBackend {
       ...sandbox,
       developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
       ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.fastMode !== undefined ? { serviceTier: opts.fastMode ? 'fast' : null } : {}),
     });
-    return new CodexThread(client, res.thread.id, opts.model, opts.effort);
+    return new CodexThread(client, res.thread.id, opts.model, opts.effort, opts.fastMode);
   }
 
   async resumeThread(opts: ResumeThreadOptions): Promise<AgentThread> {
@@ -665,8 +669,9 @@ export class CodexAppServerBackend implements AgentBackend {
       ...sandbox,
       developerInstructions: BRIDGE_DEVELOPER_INSTRUCTIONS,
       ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.fastMode !== undefined ? { serviceTier: opts.fastMode ? 'fast' : null } : {}),
     });
-    return new CodexThread(client, res.thread.id, opts.model, opts.effort);
+    return new CodexThread(client, res.thread.id, opts.model, opts.effort, opts.fastMode);
   }
 
   private async spawn(cwd: string): Promise<AppServerClient> {

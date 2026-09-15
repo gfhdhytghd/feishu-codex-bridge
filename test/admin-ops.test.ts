@@ -424,3 +424,16 @@ describe('createAdminWriteExecutor / runAdminWriteOp（Web · IPC 入口）', ()
     ).rejects.toBeInstanceOf(AdminWriteError);
   });
 });
+
+
+describe('persist Fast project defaults', () => {
+  it('round-trips on/off and preserves preference on legacy model-only saves', async () => {
+    await performSetModelDefault({ projectName: 'demo', model: 'gpt-5.5', fastMode: true });
+    expect((await getProjectByName('demo'))?.defaultFastMode).toBe(true);
+    await performSetModelDefault({ projectName: 'demo', model: 'gpt-5.5', effort: 'high' });
+    expect((await getProjectByName('demo'))?.defaultFastMode).toBe(true);
+    await performSetModelDefault({ projectName: 'demo', model: 'gpt-5.5', fastMode: false });
+    expect((await getProjectByName('demo'))?.defaultFastMode).toBe(false);
+  });
+});
+

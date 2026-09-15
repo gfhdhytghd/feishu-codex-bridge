@@ -27,6 +27,7 @@ export interface SessionRecord {
   titleJobKey?: string;
   model?: string;
   effort?: ReasoningEffort;
+  fastMode?: boolean;
   /** first user message excerpt, for context */
   summary: string;
   /** createTime (epoch ms) of the most recent message woven into this session —

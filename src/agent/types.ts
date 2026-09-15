@@ -195,6 +195,8 @@ export interface CompactResult {
 export interface TurnOptions {
   model?: string;
   effort?: ReasoningEffort;
+  /** Explicit Fast preference; undefined preserves the host default. */
+  fastMode?: boolean;
 }
 
 export interface AgentThread {
@@ -235,6 +237,8 @@ export interface StartThreadOptions {
   cwd: string;
   model?: string;
   effort?: ReasoningEffort;
+  /** Explicit Fast preference; undefined preserves the host default. */
+  fastMode?: boolean;
   /** permission tier; undefined → 'full' (preserves legacy danger-full-access) */
   mode?: PermissionMode;
   /** let the sandboxed agent's shell reach the network (qa/write only; full is

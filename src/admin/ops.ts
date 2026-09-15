@@ -293,11 +293,12 @@ export async function performSetModelDefault(opts: {
   projectName: string;
   model: string;
   effort?: ReasoningEffort;
+  fastMode?: boolean;
 }): Promise<AdminWriteOutcome> {
   const p = await getProjectByName(opts.projectName);
   if (!p) return { ok: false, reason: `项目「${opts.projectName}」不存在` };
-  await updateProject(opts.projectName, { defaultModel: opts.model, defaultEffort: opts.effort });
-  return { ok: true, project: await freshOr(opts.projectName, { ...p, defaultModel: opts.model, defaultEffort: opts.effort }) };
+  await updateProject(opts.projectName, { defaultModel: opts.model, defaultEffort: opts.effort, ...(opts.fastMode !== undefined ? { defaultFastMode: opts.fastMode } : {}) });
+  return { ok: true, project: await freshOr(opts.projectName, { ...p, defaultModel: opts.model, defaultEffort: opts.effort, ...(opts.fastMode !== undefined ? { defaultFastMode: opts.fastMode } : {}) }) };
 }
 
 /**

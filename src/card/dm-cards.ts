@@ -1484,7 +1484,7 @@ export function buildCompletionReminderCustomCard(cfg: AppConfig): CardObject {
  * {@link buildSettingsCard}. Admin-gated by the handler.
  */
 export function buildGroupSettingsCard(
-  project: Pick<Project, 'name' | 'kind' | 'noMention' | 'origin' | 'autoCompact' | 'defaultModel' | 'defaultEffort'>,
+  project: Pick<Project, 'name' | 'kind' | 'noMention' | 'origin' | 'autoCompact' | 'defaultModel' | 'defaultEffort' | 'defaultFastMode'>,
 ): CardObject {
   const kind = project.kind ?? 'multi';
   const noMention = project.noMention ?? defaultNoMention(project);
@@ -1669,10 +1669,11 @@ const EFFORT_ORDER: readonly ReasoningEffort[] = REASONING_EFFORTS;
 
 /** One-line summary of a project's default model/effort, for the settings cards.
  * Sync (no model list) — shows the raw stored id (e.g. `gpt-5.5`) or「后端默认」. */
-export function modelDefaultSummary(p: Pick<Project, 'defaultModel' | 'defaultEffort'>): string {
-  if (!p.defaultModel) return '后端默认（未设）';
+export function modelDefaultSummary(p: Pick<Project, 'defaultModel' | 'defaultEffort' | 'defaultFastMode'>): string {
+  const fast = p.defaultFastMode === undefined ? '' : ` · Fast ${p.defaultFastMode ? '开启' : '关闭'}`;
+  if (!p.defaultModel) return `后端默认（未设）${fast}`;
   const eff = p.defaultEffort ? ` · 强度 ${reasoningEffortLabel(p.defaultEffort)}` : '';
-  return `${p.defaultModel}${eff}`;
+  return `${p.defaultModel}${eff}${fast}`;
 }
 
 /**
@@ -1687,7 +1688,7 @@ export function modelDefaultSummary(p: Pick<Project, 'defaultModel' | 'defaultEf
  * 调用方按项目 backend 实时拉取后传入。
  */
 export function buildModelDefaultCard(
-  p: Pick<Project, 'name' | 'defaultModel' | 'defaultEffort'>,
+  p: Pick<Project, 'name' | 'backend' | 'defaultModel' | 'defaultEffort' | 'defaultFastMode'>,
   models: ModelInfo[],
   ctx: 'dm' | 'group',
   notice?: string,
@@ -1715,7 +1716,8 @@ export function buildModelDefaultCard(
     ),
   ];
 
-  if (!canPickModel && !canPickEffort) {
+  const canPickFast = (p.backend ?? DEFAULT_BACKEND_ID) === DEFAULT_BACKEND_ID;
+  if (!canPickModel && !canPickEffort && !canPickFast) {
     return card(
       [
         ...head,
@@ -1750,6 +1752,16 @@ export function buildModelDefaultCard(
         initial: curEffort,
       }),
     );
+  }
+  if (canPickFast) {
+    formEls.push(md('⚡ **默认 Fast 模式**'), selectMenu({
+      name: 'fastMode', placeholder: '选择 Fast 模式',
+      initial: p.defaultFastMode === undefined ? 'default' : p.defaultFastMode ? 'on' : 'off',
+      options: [
+        ...(p.defaultFastMode === undefined ? [{ label: '沿用 Codex 设置（未覆盖）', value: 'default' }] : []),
+        { label: 'Fast：开启', value: 'on' }, { label: 'Fast：关闭', value: 'off' },
+      ],
+    }), note('Fast 会增加用量消耗，可用性取决于模型和账号。'));
   }
   formEls.push(actions([submitButton('✅ 保存默认', submit, 'primary', 'submit_model_default')]));
 
@@ -1808,6 +1820,7 @@ export function buildProjectSettingsCard(
     | 'backend'
     | 'defaultModel'
     | 'defaultEffort'
+    | 'defaultFastMode'
   >,
   backendName?: string,
   notice?: string,
