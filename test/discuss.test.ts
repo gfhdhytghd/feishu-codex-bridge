@@ -209,3 +209,21 @@ it('does not commit a summary finishing after the project turns it off', async (
   await new Promise(resolve => setTimeout(resolve, 100));
   expect((await state()).lanes.key.summary).toBeUndefined();
 });
+
+
+it('bounds raw background for a new host and never consumes skipped messages', async () => {
+  const file = join(dir, 'bounded.json');
+  const entries = Array.from({ length: 500 }, (_, i) => ({ seq: i + 1, msg: { ...msg(`m-${i}`), content: '汉'.repeat(4000) }, state: 'ignored' }));
+  await writeFile(file, JSON.stringify({ version: 1, lanes: { key: { entries, injected: {}, generation: 0, next: 501 } } }));
+  const worker = new Discuss(file, history, { snapshot: async () => snap, reconcile: async () => false, deliver: async () => false,
+    enabled: async () => false, summaryPolicy: async () => ({ enabled: false, model: 'unused', fast: false }) }, (() => { throw new Error('No model needed'); }) as never, source);
+  workers.push(worker);
+  const context = await worker.context('key', 'new-host', ['m-0']);
+  expect(Buffer.byteLength(context.block)).toBeLessThan(66 * 1024);
+  expect(context.block).toContain('m-0'); expect(context.block).toContain('m-499');
+  expect(context.block).toContain('省略');
+  context.receipt.accepted(); await context.receipt.settled;
+  const saved = JSON.parse(await readFile(file, 'utf8'));
+  expect(saved.lanes.key.rawInjected['new-host']).toBe(1);
+  expect((await worker.context('key', 'new-host')).block).toContain('省略');
+});

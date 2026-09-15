@@ -12,6 +12,8 @@ const fake = vi.hoisted(() => ({
   participation: undefined as undefined | 'all' | 'model' | 'mention',
   action: 'FOLLOW_UP',
   judgeCalls: 0,
+  judgeInputs: [] as any[],
+  transcribe: vi.fn(async () => '转写后的请求'),
   judgeGate: undefined as Promise<void> | undefined,
   reaction: vi.fn(async () => ({ data: { reaction_id: 'reaction' } })),
   final: vi.fn(async () => true),
@@ -25,6 +27,7 @@ vi.mock('../src/admin/ops', async original => ({
     fake.evict = deps.evictLiveSessionsForChat; return async () => undefined;
   },
 }));
+vi.mock('../src/bot/voice', async original => ({ ...await original<object>(), transcribeVoice: fake.transcribe }));
 vi.mock('../src/core/logger', () => ({ log: fake.log, withTrace: (_ctx: unknown, fn: () => unknown) => fn() }));
 vi.mock('../src/agent', async (original) => ({ ...await original<object>(), createBackend: () => fake.backend }));
 vi.mock('../src/project/registry', async (original) => ({
@@ -99,7 +102,7 @@ function setup(policy: 'steer' | 'queue' = 'steer') {
   return orchestrator;
 }
 beforeEach(() => {
-  vi.clearAllMocks(); fake.participation = undefined; fake.discuss = true; fake.action = 'FOLLOW_UP'; fake.judgeCalls = 0; fake.judgeGate = undefined;
+  vi.clearAllMocks(); fake.participation = undefined; fake.discuss = true; fake.action = 'FOLLOW_UP'; fake.judgeCalls = 0; fake.judgeInputs = []; fake.transcribe.mockReset().mockResolvedValue('转写后的请求'); fake.judgeGate = undefined;
   fake.final.mockReset().mockResolvedValue(true);
   fake.createCard.mockReset().mockResolvedValue('card');
   fake.send.mockReset().mockResolvedValue({});
@@ -118,7 +121,7 @@ vi.mock('../src/agent/codex-appserver/discuss-runner', () => ({
       if (opts.model === 'gpt-5.6-luna') return JSON.stringify({ topics: [], requests: [], constraints: [], decisions: [], results: [], uncertain: [] });
       fake.judgeCalls++;
       await fake.judgeGate;
-      const data = JSON.parse(input);
+      const data = JSON.parse(input); fake.judgeInputs.push(data);
       return JSON.stringify({ hostId: data.hostId, runId: data.runId, lookup: null,
         decisions: data.messages.map((m: { messageId: string }) => ({ messageId: m.messageId, action: fake.action, reason: 'test' })) });
     },
@@ -230,4 +233,31 @@ it.each(['all', 'model', 'mention'] as const)('routes ordinary messages accordin
     expect(fake.judgeCalls).toBe(policy === 'model' ? 1 : 0);
     run.turns[0]!.resolve(); await pending;
   }
+});
+
+
+it('transcribes unmentioned voice before judgment and preserves following message order', async () => {
+  fake.action = 'IGNORE';
+  const asr = deferred<string>(); fake.transcribe.mockReturnValueOnce(asr.promise);
+  const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
+  const o = setup();
+  await o.onMessage({ ...message('[audio]'), mentionedBot: false, rawContentType: 'audio' });
+  await until(() => expect(fake.transcribe).toHaveBeenCalledTimes(1));
+  await o.onMessage({ ...message('后续文字'), mentionedBot: false });
+  expect(fake.judgeCalls).toBe(0);
+  asr.resolve('请检查机器故障');
+  await vi.waitFor(() => expect(fake.judgeInputs.flatMap(d => d.messages).map(m => m.text)).toEqual(['请检查机器故障', '后续文字']), { timeout: 3500 });
+  expect(run.consumed).toHaveLength(0);
+});
+
+it('does not judge a voice preparation invalidated by permission eviction', async () => {
+  fake.action = 'IGNORE';
+  const asr = deferred<string>(); fake.transcribe.mockReturnValueOnce(asr.promise);
+  const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
+  const o = setup();
+  await o.onMessage({ ...message('[audio]'), mentionedBot: false, rawContentType: 'audio' });
+  await until(() => expect(fake.transcribe).toHaveBeenCalledTimes(1));
+  await fake.evict!('chat'); asr.resolve('不得执行');
+  await new Promise(r => setTimeout(r, 1100));
+  expect(fake.judgeCalls).toBe(0);
 });

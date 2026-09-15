@@ -33,3 +33,9 @@
 群内 `/settings`、私聊「项目设置」及 Web 项目设置均提供「消息简史」开关和模型 / Fast 配置。使用 `contextBriefing`、`contextBriefingModel`、`contextBriefingFast` 持久化，独立于 `discuss` 和主 Agent 模型。默认模型为 `gpt-5.6-luna`，Fast 默认关闭。
 
 修改模型或 Fast 后，简史工作会话按新配置恢复，保留已有摘要；旧配置下未完成的摘要不再提交。关闭后停止摘要生成和摘要注入，继续提供原文。Fast 显式传入 Codex `serviceTier: "fast"`，关闭传 `null` 清除旧会话档位；服务实际支持情况由模型和账号决定，参见 [Codex 配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)。
+
+## 输入准备与上下文预算
+
+非 @ 语音先按会话顺序转写，再交给判断器；降级卡片先补全正文。清理、权限变更、显式 @ 接管会取消尚未完成的准备，迟到结果不会进入判断。
+
+主线程背景原文最多 64 KiB，单条正文最多 16 KiB，摘要最多 32 KiB。优先本次消息与最近记录，并标注省略/截断；原文游标只跨过实际完整注入的连续记录，不把跳过的历史冒充已消费。完整资料仍留在历史日志中，按需查询。预算不替代日志归档策略。

@@ -26,6 +26,8 @@ export class OrderedPreparation {
     owner.tail = task;
   }
 
+  hasPending(key: string): boolean { return this.lanes.has(key); }
+
   cancel(key: string): number {
     const lane = this.lanes.get(key);
     if (!lane) return 0;

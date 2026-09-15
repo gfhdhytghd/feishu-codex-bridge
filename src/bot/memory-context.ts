@@ -20,7 +20,7 @@ export async function loadMemoryContext(cfg: AppConfig, input: MemoryContextInpu
 
   return await new Promise<string>((resolve) => {
     const child = spawn(config.command, config.args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
+      stdio: ['pipe', 'pipe', 'ignore'],
       env: { ...process.env },
     });
     const stdout: Buffer[] = [];

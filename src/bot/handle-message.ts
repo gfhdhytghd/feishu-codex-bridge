@@ -805,6 +805,7 @@ export function createOrchestrator(
     void channel.send(msg.chatId, { markdown: `❌ ${detail}。本条语音未提交给模型。` },
       { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
   }
+  const discussPreparation = new OrderedPreparation();
   const contextIntake = new OrderedPreparation();
   const contextTargets = new Map<string, NormalizedMessage>();
   const cancelContext = (key: string): void => {
@@ -812,7 +813,7 @@ export function createOrchestrator(
     for (const msg of earlyReactions.keys()) if (earlyReactionKeys.get(msg) === key) finishEarly(msg);
     briefings?.cancel(key);
     discuss.cancel(key);
-    const count = contextIntake.cancel(key) + voiceIntake.cancel(key);
+    const count = discussPreparation.cancel(key) + contextIntake.cancel(key) + voiceIntake.cancel(key);
     const target = contextTargets.get(key);
     if (target) finishEarly(target);
     contextTargets.delete(key);
@@ -1094,6 +1095,37 @@ export function createOrchestrator(
     if (project && discussEnabled(project) && isChatAllowed(cfg, msg.chatId) && isUserAllowedInProject(cfg, project, msg.senderId)) {
       const key = turnSession(msg.chatId, project, msg.senderId).sessionKey;
       const command = Boolean(parseCommand(msg.content.trim()));
+      if (msg.mentionedBot) {
+        const cancelled = discussPreparation.cancel(key);
+        if (cancelled) {
+          log.info('intake', 'discuss-preparation-cancelled', { key, count: cancelled });
+          void channel.send(msg.chatId, { markdown: `⚠️ ${cancelled} 条尚未完成内容读取的消息已取消，请按需重发。` }, { replyTo: msg.messageId }).catch(() => undefined);
+        }
+      }
+      if (!msg.mentionedBot && !command && (messageHasVoice(msg) ||
+          (msg.rawContentType === 'interactive' && isDegradedCardContent(msg.content)) || discussPreparation.hasPending(key))) {
+        contextTargets.set(key, msg);
+        const guard = resolutionGuard(key);
+        discussPreparation.submit(key, async signal => {
+          if (messageHasVoice(msg)) await voiceText(msg, signal);
+          if (msg.rawContentType === 'interactive' && isDegradedCardContent(msg.content)) {
+            const full = await fetchInteractiveCardText(channel, msg.messageId);
+            if (!full) throw new Error('卡片正文读取失败，请重发');
+            msg.content = full;
+          }
+          signal.throwIfAborted(); guard();
+          return signal;
+        }, async signal => {
+          const current = await getProjectByChatId(msg.chatId);
+          if (signal.aborted) return;
+          guard();
+          if (!current || !discussEnabled(current) || !isUserAllowedInProject(cfg, current, msg.senderId) ||
+              !isChatAllowed(cfg, msg.chatId) || turnSession(msg.chatId, current, msg.senderId).sessionKey !== key) return;
+          briefings?.observe(msg);
+          await discuss.observe(key, msg, false, false);
+        }, err => voiceFailed(msg, true, err));
+        return;
+      }
       if (msg.mentionedBot && !command) {
         const reaction = runReaction(msg.messageId, false);
         earlyReactions.set(msg, reaction);
@@ -1969,6 +2001,7 @@ export function createOrchestrator(
    * to re-resume under the new tier (or fail-closed where it can't be enforced).
    */
   async function evictLiveSessionsForChat(chatId: string): Promise<void> {
+    for (const [key, msg] of contextTargets) if (msg.chatId === chatId) cancelContext(key);
     for (const [key, chat] of resolutionChats) if (chat === chatId) invalidateResolution(key);
     let closed = 0;
     for (const rec of await listSessions()) {
@@ -5862,6 +5895,7 @@ export function createOrchestrator(
     for (const msg of earlyReactions.keys()) finishEarly(msg);
     voiceShutdown.abort();
     voiceIntake.close();
+    discussPreparation.close();
     contextIntake.close();
     await briefings?.close();
     await discuss.close();
