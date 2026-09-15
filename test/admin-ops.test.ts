@@ -8,6 +8,7 @@ import {
   createAdminWriteExecutor,
   performBackendSwitch,
   performSetAutoCompact,
+  performSetModelDefault,
   performSetCompletionReminder,
   performSetNoMention,
   performSetPermissionMode,

@@ -1,7 +1,11 @@
+// Transport tests observe only the requested session, not background warm-up threads.
+vi.mock('../src/agent/codex-appserver/client-pool', async original => ({
+  ...await original<object>(), takeWarmClient: () => null, refillWarmPool: async () => undefined,
+}));
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { CodexAppServerBackend } from '../src/agent/codex-appserver/backend';
 import type { AgentThread, TurnOptions } from '../src/agent/types';
 
