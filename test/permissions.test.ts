@@ -149,6 +149,29 @@ describe('sandboxParams', () => {
     }
   });
 
+  it('macOS reports a clear fail-closed diagnostic if the discovered executable disappears', () => {
+    const missing = Object.assign(new Error('fixture removed during upgrade'), { code: 'ENOENT' });
+    for (const failAt of ['launcher', 'parent']) {
+      const spy = vi.spyOn(nodeFs, 'realpathSync').mockImplementation(((path: string) => {
+        if (failAt === 'launcher' || path === '/mock-home') throw missing;
+        return '/mock-runtime/codex';
+      }) as typeof nodeFs.realpathSync);
+      try {
+        withPlatform('darwin', () => {
+          for (const mode of ['qa', 'write'] as const) {
+            let failure: unknown;
+            try { sandboxParams(mode, false, '/mock-home/codex'); } catch (error) { failure = error; }
+            expect(failure).toBeInstanceOf(Error);
+            expect((failure as Error).message).toContain('已拒绝启动项目权限会话');
+            expect((failure as Error).message).toContain('CODEX_BIN');
+            expect((failure as Error).cause).toBe(missing);
+          }
+          expect(sandboxParams('full', false, '/mock-home/codex')).toEqual({ sandbox: 'danger-full-access' });
+        });
+      } finally { spy.mockRestore(); }
+    }
+  });
+
   it('fail-closed on Linux/WSL: qa/write throw (reads not confined there), full still works', () => {
     withPlatform('linux', () => {
       expect(() => sandboxParams('qa', false)).toThrow();

@@ -89,10 +89,22 @@ export function sandboxParams(
   const runtimeReads: Record<string, 'read'> = {};
   if (process.platform === 'darwin' && runtimeBin) {
     const launcher = resolve(runtimeBin);
-    const runtime = realpathSync(launcher);
+    let runtime: string;
+    let launcherDir: string;
+    try {
+      runtime = realpathSync(launcher);
+      launcherDir = realpathSync(dirname(launcher));
+    } catch (cause) {
+      // The binary can disappear between discovery and profile construction
+      // (e.g. an in-place upgrade). Refuse before spawn; never broaden access.
+      throw new Error(
+        '无法验证 Codex 运行路径，已拒绝启动项目权限会话。启动器可能已被移动、升级或无法读取；请检查 CODEX_BIN / Codex 安装后重试。',
+        { cause },
+      );
+    }
     runtimeReads[launcher] = 'read';
     runtimeReads[runtime] = 'read';
-    const launcherDir = realpathSync(dirname(launcher));
+
     for (const prefix of ['/opt/homebrew', '/usr/local']) {
       if (dirname(launcher) !== `${prefix}/bin` || launcherDir !== `${prefix}/bin`) continue;
       // Canonical runtime must stay inside the codex package, including after
