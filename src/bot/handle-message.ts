@@ -1389,7 +1389,7 @@ export function createOrchestrator(
           mode: perm.mode,
           network: perm.network,
           autoCompact: perm.autoCompact,
-        }).then((r) => {
+        }, goal).then((r) => {
           tResolveDone = Date.now();
           return r;
         });
@@ -1557,15 +1557,20 @@ export function createOrchestrator(
     threadId: string,
     chatId: string,
     perm?: { mode?: PermissionMode; network?: boolean; autoCompact?: boolean },
+    refreshPreferences = false,
   ): Promise<{ thread: AgentThread | undefined; recreated: boolean }> {
     const live = sessions.get(threadId);
     if (live) {
-      if (live.isAlive()) return { thread: live, recreated: false };
+      if (live.isAlive() && !refreshPreferences) return { thread: live, recreated: false };
+      // Goals auto-start natively and never pass through turn/start. Resume the
+      // same native session with the latest persisted preferences before a goal,
+      // including Fast changes made by /model since the previous ordinary turn.
+      if (refreshPreferences) await live.close();
       // app-server 子进程已死（崩溃/被 kill）：死线程留在缓存只会反复失败，
       // 清掉让它落入下面既有的 resume-or-recreate 兜底（持久化的 sessionId
       // 还在，话题自愈而不是僵死到重启）。
       sessions.delete(threadId);
-      log.info('agent', 'dead-thread-evict', { threadId });
+      log.info('agent', refreshPreferences ? 'goal-preferences-refresh' : 'dead-thread-evict', { threadId });
     }
     const rec = await getSession(threadId);
     if (!rec) return { thread: undefined, recreated: false };
@@ -1985,6 +1990,7 @@ export function createOrchestrator(
         // codex thread for a codex session, claude for a claude one.
         const be = backendFor(rec?.backend ?? project?.backend);
         const cwd = rec?.cwd ?? project?.cwd ?? fallbackCwd;
+        const fastMode = rec ? rec.fastMode : project?.defaultFastMode;
         // Carry the session's chosen model/effort into the new thread so /clear
         // resets the CONVERSATION, not the user's model pick. Tier (mode/network/
         // autoCompact) comes from the caller's live perm.
@@ -1992,7 +1998,7 @@ export function createOrchestrator(
           cwd,
           model: rec?.model,
           effort: rec?.effort,
-          fastMode: rec?.fastMode,
+          fastMode,
           mode: perm.mode,
           network: perm.network,
           autoCompact: perm.autoCompact,
@@ -2019,7 +2025,7 @@ export function createOrchestrator(
           titleJobKey,
           model: rec?.model,
           effort: rec?.effort,
-          fastMode: rec?.fastMode,
+          fastMode,
           summary: '(新会话)',
           createdAt: Date.now(),
           updatedAt: Date.now(),
