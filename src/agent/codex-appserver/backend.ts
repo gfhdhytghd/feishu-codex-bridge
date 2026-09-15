@@ -304,6 +304,7 @@ class CodexThread implements AgentThread {
     // The caller owns the new failure mode (card setup throws after the turn
     // started): launchRun aborts+closes the thread on that path.
     //
+    // Live probe (2026-09-15): ACK returned in 12ms, before turn/started.
     // The response identifies THIS request's turn. Notifications can arrive
     // before it and stay buffered in the client; never infer identity from the
     // first turn/started (it may belong to an old turn or a subagent).
@@ -396,48 +397,53 @@ class CodexThread implements AgentThread {
       let armed = false;
       let turnActive = false;
       let goalDone = false; // a terminal goal status was seen; drain the live turn, then stop
-      while (true) {
-        const step = await Promise.race([stream.next(), setFailed]);
-        if (step === 'set-failed') {
-          yield { type: 'error', message: setError?.message ?? 'thread/goal/set 请求失败', willRetry: false };
-          return;
-        }
-        if (step.done) return;
-        lastActivityAt = Date.now();
-        const ev = mapNotification(step.value);
-        if (!ev) continue;
-        if (ev.type === 'turn_started') {
-          self.currentTurnId = ev.turnId;
-          armed = true; // a real turn for our goal is running
-          turnActive = true;
-          yield ev;
-          continue;
-        }
-        if (ev.type === 'done') {
-          turnActive = false;
-          yield ev;
-          // The goal is terminal AND its final turn just finished — now stop.
-          if (goalDone) return;
-          continue;
-        }
-        if (ev.type === 'goal_update') {
-          if (ev.objective !== objective) continue; // stale snapshot for a different goal
-          if (ev.status === 'active' || ev.status === 'paused') armed = true;
-          yield ev;
-          // A goal spans many auto-continued turns — a per-turn `done` is NOT the
-          // end. On a terminal goal status: codex emits update_goal(complete) BEFORE
-          // the model's closing answer (verified — the final agentMessage arrives a
-          // couple seconds AFTER goal/complete), so returning here would cut the
-          // result off. If a turn is in flight, keep consuming until its turn/completed
-          // so the final answer renders; otherwise stop now.
-          if (armed && isGoalTerminal(ev.status)) {
-            if (turnActive) goalDone = true;
-            else return;
+      try {
+        while (true) {
+          const step = await Promise.race([stream.next(), setFailed]);
+          if (step === 'set-failed') {
+            yield { type: 'error', message: setError?.message ?? 'thread/goal/set 请求失败', willRetry: false };
+            return;
           }
-          continue;
+          if (step.done) return;
+          lastActivityAt = Date.now();
+          const ev = mapNotification(step.value);
+          if (!ev) continue;
+          if (ev.type === 'turn_started') {
+            self.currentTurnId = ev.turnId;
+            armed = true; // a real turn for our goal is running
+            turnActive = true;
+            yield ev;
+            continue;
+          }
+          if (ev.type === 'done') {
+            turnActive = false;
+            yield ev;
+            // The goal is terminal AND its final turn just finished — now stop.
+            if (goalDone) return;
+            continue;
+          }
+          if (ev.type === 'goal_update') {
+            if (ev.objective !== objective) continue; // stale snapshot for a different goal
+            if (ev.status === 'active' || ev.status === 'paused') armed = true;
+            yield ev;
+            // A goal spans many auto-continued turns — a per-turn `done` is NOT the
+            // end. On a terminal goal status: codex emits update_goal(complete) BEFORE
+            // the model's closing answer (verified — the final agentMessage arrives a
+            // couple seconds AFTER goal/complete), so returning here would cut the
+            // result off. If a turn is in flight, keep consuming until its turn/completed
+            // so the final answer renders; otherwise stop now.
+            if (armed && isGoalTerminal(ev.status)) {
+              if (turnActive) goalDone = true;
+              else return;
+            }
+            continue;
+          }
+          yield ev;
+          if (ev.type === 'error' && !ev.willRetry) return; // a fatal error kills the run
         }
-        yield ev;
-        if (ev.type === 'error' && !ev.willRetry) return; // a fatal error kills the run
+      } finally {
+        await stream.return?.();
+        self.currentTurnId = undefined;
       }
     }
     return { events: gen(), turnId: () => self.currentTurnId, lastActivity: () => lastActivityAt };
@@ -488,7 +494,10 @@ class CodexThread implements AgentThread {
       while (true) {
         const step = await Promise.race([stream.next(), startFailed, timeout]);
         if (step === 'start-failed') throw startError ?? new Error('thread/compact/start 请求失败');
-        if (step === 'timeout') throw new Error(`压缩超时（codex 未在 ${COMPACT_TIMEOUT_MS / 1000}s 内完成）`);
+        if (step === 'timeout') {
+          void this.close().catch(() => undefined);
+          throw new Error(`压缩超时（codex 未在 ${COMPACT_TIMEOUT_MS / 1000}s 内完成）`);
+        }
         if (step.done) break;
         const ev = mapNotification(step.value);
         if (!ev) continue;
@@ -499,6 +508,7 @@ class CodexThread implements AgentThread {
       }
     } finally {
       if (timer) clearTimeout(timer);
+      await stream.return?.();
     }
     return { compacted, usage };
   }

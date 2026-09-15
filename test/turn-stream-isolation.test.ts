@@ -17,6 +17,9 @@ let count = 0;
 readline.createInterface({input:process.stdin}).on('line', line => {
   const msg = JSON.parse(line);
   if (typeof msg.id !== 'number') return;
+  if (['thread/compact/start', 'thread/goal/set'].includes(msg.method)) {
+    setTimeout(() => send({id:msg.id,error:{code:-32000,message:'rejected'}}), 20); return;
+  }
   if (msg.method !== 'turn/start') {
     send({id:msg.id,result:msg.method === 'thread/start' ? {thread:{id:'host'}} : {}});
     return;
@@ -116,4 +119,16 @@ describe.skipIf(process.platform === 'win32')('ordinary turn notification isolat
       }
     });
   });
+});
+
+it.each(['compact', 'goal'])('a rejected %s leaves no reader to steal the next turn', async operation => {
+ await withThread(async thread => {
+  if (operation === 'compact') await expect(thread.compact()).rejects.toThrow('rejected');
+  else expect(await collect(thread.runGoal('test'))).toEqual([expect.objectContaining({type:'error'})]);
+  expect(await collect(thread.runStreamed({text:'clean'}))).toEqual([
+   {type:'turn_started',turnId:'turn-1'},
+   {type:'text_delta',itemId:'turn-1',delta:'correct clean'},
+   {type:'done',turnId:'turn-1'},
+  ]);
+ });
 });

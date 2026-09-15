@@ -1,3 +1,4 @@
+import { UnsentRequestError } from '../src/agent/types';
 import { JsonRpcError } from '../src/agent/codex-appserver/app-server-client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NormalizedMessage } from '@larksuiteoapi/node-sdk';
@@ -215,8 +216,8 @@ it.each(['disconnect', 'missing-response'])('does not replay uncertain steer del
 });
 
 it('queues directly when the backend does not support steer', async () => {
- fake.backend.capabilities.steer = false;
- const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
+ fake.backend.capabilities.steer = true; // project default differs from the actual thread
+ const run = thread(); Object.assign(run.t, { supportsSteer: false }); fake.backend.resumeThread.mockResolvedValue(run.t);
  const o = setup(); await o.onMessage(message('first'));
  await until(() => expect(run.consumed).toHaveLength(1));
  await o.onMessage(message('second'));
@@ -224,5 +225,29 @@ it('queues directly when the backend does not support steer', async () => {
  run.turns[0]!.resolve();
  await until(() => expect(run.consumed).toHaveLength(2));
  expect(run.consumed[1]!.text).toContain('second');
+ run.turns[1]!.resolve();
+});
+
+it('resubmits a definitely unsent message on a fresh thread after a process exit', async () => {
+ const first = thread(), next = thread();
+ fake.backend.resumeThread.mockResolvedValueOnce(first.t).mockResolvedValue(next.t);
+ const o = setup(); await o.onMessage(message('first'));
+ await until(() => expect(first.consumed).toHaveLength(1));
+ first.t.isAlive = () => false;
+ first.t.steer.mockRejectedValueOnce(new UnsentRequestError('app-server client closed'));
+ await o.onMessage(message('unsent followup'));
+ await until(() => expect(next.consumed).toHaveLength(1));
+ expect(next.consumed[0]!.text).toContain('unsent followup');
+ first.turns[0]!.resolve(); next.turns[0]!.resolve();
+});
+it('keeps the healthy thread and queued messages after terminal card failure', async () => {
+ const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
+ const o = setup('queue'); await o.onMessage(message('first'));
+ await until(() => expect(run.consumed).toHaveLength(1));
+ await o.onMessage(message('second'));
+ fake.final.mockRejectedValueOnce(new Error('Feishu 503'));
+ run.turns[0]!.resolve();
+ await until(() => expect(run.consumed).toHaveLength(2));
+ expect(run.t.close).not.toHaveBeenCalled();
  run.turns[1]!.resolve();
 });
