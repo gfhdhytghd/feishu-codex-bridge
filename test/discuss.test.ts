@@ -227,3 +227,23 @@ it('bounds raw background for a new host and never consumes skipped messages', a
   expect(saved.lanes.key.rawInjected['new-host']).toBe(1);
   expect((await worker.context('key', 'new-host')).block).toContain('省略');
 });
+
+
+it('falls back to raw history without consuming an oversized summary version', async () => {
+  const file = join(dir, 'oversized-summary.json');
+  const entries = [{ seq: 1, msg: { ...msg('original'), content: '尾部约束必须保留' }, state: 'ignored' }];
+  await writeFile(file, JSON.stringify({ version: 1, lanes: { key: { entries, injected: {}, generation: 0, next: 2,
+    summary: { version: 1, covered: 1, body: '汉'.repeat(30000), gaps: [] } } } }));
+  const worker = new Discuss(file, history, { snapshot: async () => snap, reconcile: async () => false, deliver: async () => false,
+    enabled: async () => false }, (() => { throw new Error('No model needed'); }) as never, source);
+  workers.push(worker);
+  const context = await worker.context('key', 'host');
+  expect(context.block).toContain('尾部约束必须保留');
+  expect(context.block).toContain('简报超过预算');
+  expect(Buffer.byteLength(context.block)).toBeLessThan(66 * 1024);
+  context.receipt.accepted(); await context.receipt.settled;
+  const saved = JSON.parse(await readFile(file, 'utf8'));
+  expect(saved.lanes.key.injected.host).toBeUndefined();
+  expect(saved.lanes.key.rawInjected.host).toBe(1);
+  expect((await worker.context('key', 'another-host')).block).toContain('尾部约束必须保留');
+});

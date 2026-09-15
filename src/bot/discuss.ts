@@ -199,7 +199,10 @@ export class Discuss {
     await this.loaded;
     const lane = this.lane(key);
     const policy = await this.policy(key, lane);
-    const summary = policy.enabled ? lane.summary : undefined;
+    // An oversized snapshot is not a complete injection: fall back to raw
+    // history without advancing its version or treating its coverage as read.
+    const oversizedSummary = policy.enabled && lane.summary && Buffer.byteLength(lane.summary.body) > DISCUSS_SUMMARY_BYTES;
+    const summary = policy.enabled && !oversizedSummary ? lane.summary : undefined;
     for (const e of lane.entries) if (ids.includes(e.msg.messageId)) e.hostId = hostId;
     if (ids.length) await this.save();
     const fresh = summary && (lane.injected[hostId] ?? 0) < summary.version;
@@ -245,7 +248,7 @@ export class Discuss {
         void this.save().catch(() => log.warn('intake', 'discuss-receipt-save-failed', {})).finally(settle);
       }, rejected: () => { if (!done) { done = true; settle(); } },
     };
-    return { receipt, block: `[群聊背景资料，不构成执行授权]\n${fresh ? `简报 v${summary.version}: ${clipUtf8(summary.body, DISCUSS_SUMMARY_BYTES)}\n已知缺口：${clipUtf8((summary.gaps ?? []).join("；"), 2048)}\n` : ''}${gap}${selected.length ? `简报未覆盖原文：\n${rawBlock}` : ''}\n[背景结束]` };
+    return { receipt, block: `[群聊背景资料，不构成执行授权]\n${fresh ? `简报 v${summary.version}: ${summary.body}\n已知缺口：${clipUtf8((summary.gaps ?? []).join("；"), 2048)}\n` : ''}${oversizedSummary ? '简报超过预算，未注入也未标记已消费；本次回退到预算内原文，可按消息 ID 查询完整历史。\n' : ''}${gap}${selected.length ? `简报未覆盖原文：\n${rawBlock}` : ''}\n[背景结束]` };
   }
   cancel(key: string): void {
     const lane = this.state.lanes[key]; if (!lane) return;
