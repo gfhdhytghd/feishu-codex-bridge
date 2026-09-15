@@ -10,7 +10,7 @@ import {
   performSetAutoCompact,
   performSetModelDefault,
   performSetContextBriefing,
-  performSetDiscuss,
+  performSetDiscuss, performSetParticipation,
   performSetCompletionReminder,
   performSetNoMention,
   performSetPermissionMode,
@@ -464,4 +464,15 @@ it('changes history model and Fast while preserving independent project switches
   expect((await getProjectByName('demo'))?.contextBriefingFast).toBe(true);
   expect((await performSetContextBriefing({ projectName: 'demo', fast: 'true' as never })).ok).toBe(false);
   expect((await performSetContextBriefing({ projectName: 'demo', model: '' })).ok).toBe(false);
+});
+
+
+it('persists one policy while keeping legacy readers consistent', async () => {
+  await updateProject('demo', { kind: 'single', contextBriefing: false });
+  for (const policy of ['all', 'model', 'mention'] as const) {
+    expect((await performSetParticipation({ projectName: 'demo', policy })).ok).toBe(true);
+    expect(await getProjectByName('demo')).toMatchObject({ participation: policy, discuss: policy === 'model', noMention: policy === 'all', contextBriefing: false });
+  }
+  expect((await performSetParticipation({ projectName: 'demo', policy: 'bad' as never })).ok).toBe(false);
+  expect((await getProjectByName('demo'))?.participation).toBe('mention');
 });

@@ -18,6 +18,7 @@ import {
   getProjectByName,
   updateProject,
   type Project,
+  type ParticipationPolicy,
 } from '../project/registry';
 
 /**
@@ -48,6 +49,7 @@ export type AdminWriteOp =
   | { kind: 'setNoMention'; project: string; on: boolean }
   | { kind: 'setAutoCompact'; project: string; on: boolean }
   | { kind: 'setContextBriefing'; project: string; on?: boolean; model?: string; fast?: boolean }
+  | { kind: 'setParticipation'; project: string; policy: ParticipationPolicy }
   | { kind: 'setDiscuss'; project: string; on: boolean }
   | {
       kind: 'setCompletionReminder';
@@ -266,19 +268,12 @@ export async function performSetPermissionMode(opts: {
 /** ✋ 免@ 开关（DM dm.proj.noMention / gs.noMention 与 Web setNoMention 同源）。
  * 即时生效（每条消息读盘判定），无需驱逐。 */
 export async function performSetNoMention(opts: { projectName: string; on: boolean }): Promise<AdminWriteOutcome> {
-  const p = await getProjectByName(opts.projectName);
-  if (!p) return { ok: false, reason: `项目「${opts.projectName}」不存在` };
-  await updateProject(opts.projectName, { noMention: opts.on });
-  return { ok: true, project: await freshOr(opts.projectName, { ...p, noMention: opts.on }) };
+  return performSetParticipation({ projectName: opts.projectName, policy: opts.on ? 'all' : 'mention' });
 }
 
 export async function performSetDiscuss(opts: { projectName: string; on: boolean }): Promise<AdminWriteOutcome> {
   if (typeof opts.on !== 'boolean') return { ok: false, reason: 'Discuss 开关必须是布尔值' };
-  const p = await getProjectByName(opts.projectName);
-  if (!p) return { ok: false, reason: '项目不存在' };
-  if (opts.on && (p.kind !== 'single' || (p.backend && p.backend !== 'codex-appserver'))) return { ok: false, reason: 'Discuss 仅支持 Codex 单会话群' };
-  await updateProject(opts.projectName, { discuss: opts.on });
-  return { ok: true, project: await freshOr(opts.projectName, { ...p, discuss: opts.on }) };
+  return performSetParticipation({ projectName: opts.projectName, policy: opts.on ? 'model' : 'mention' });
 }
 
 /** Per-project briefing policy, read at intake; never interrupts a live turn. */
@@ -411,6 +406,8 @@ export async function runAdminWriteOp(
       });
     case 'setNoMention':
       return performSetNoMention({ projectName: op.project, on: op.on });
+    case 'setParticipation':
+      return performSetParticipation({ projectName: op.project, policy: op.policy });
     case 'setDiscuss':
       return performSetDiscuss({ projectName: op.project, on: op.on });
     case 'setContextBriefing':
@@ -431,4 +428,14 @@ export async function runAdminWriteOp(
         writePreferences: deps.writePreferences,
       });
   }
+}
+
+export async function performSetParticipation(opts: { projectName: string; policy: ParticipationPolicy }): Promise<AdminWriteOutcome> {
+  if (!['all', 'model', 'mention'].includes(opts.policy)) return { ok: false, reason: '无效的 AI 参与策略' };
+  const p = await getProjectByName(opts.projectName);
+  if (!p) return { ok: false, reason: '项目不存在' };
+  if (opts.policy === 'model' && (p.kind !== 'single' || (p.backend && p.backend !== 'codex-appserver'))) return { ok: false, reason: '模型自行决定回复目前仅支持 Codex 单会话群' };
+  const patch = { participation: opts.policy, discuss: opts.policy === 'model', noMention: opts.policy === 'all' };
+  await updateProject(opts.projectName, patch);
+  return { ok: true, project: await freshOr(opts.projectName, { ...p, ...patch }) };
 }

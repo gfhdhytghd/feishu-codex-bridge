@@ -35,6 +35,7 @@ function stubService(): AdminService {
           kind: 'multi' as const,
           origin: 'created' as const,
           noMention: true,
+          participation: 'all' as const,
           autoCompact: true,
           contextBriefing: true,
           discuss: false,
@@ -60,6 +61,7 @@ function stubService(): AdminService {
     async setNoMention() {
       throw new NotWiredYetError('✋ 免@ 开关');
     },
+    async setParticipation() { throw new NotWiredYetError('AI 参与策略'); },
     async setDiscuss() { throw new NotWiredYetError('Discuss'); },
     async setContextBriefing() { throw new NotWiredYetError('上下文策略'); },
     async setAutoCompact() {
@@ -432,6 +434,7 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
     svc.setNoMention = async () => {
       throw new AdminWriteError('项目「demo」不存在');
     };
+    svc.setParticipation = async (botId, project, policy) => { written.push({ botId, project, policy }); };
     svc.setContextBriefing = async (botId, project, on, settings) => { written.push({ botId, project, on, ...settings }); };
     svc.setCompletionReminder = async (botId, value) => {
       written.push({ botId, completionReminder: value });
@@ -445,6 +448,15 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
     await writeWeb.close();
   });
 
+  it('writes each AI participation policy and rejects invalid values', async () => {
+    for (const policy of ['all', 'model', 'mention', 'bad']) {
+      const res = await fetch(`${writeBase}/api/project/demo/participation?bot=cli_a`, {
+        method: 'POST', headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ policy }),
+      });
+      expect(res.status).toBe(policy === 'bad' ? 400 : 200);
+      if (policy !== 'bad') expect(written).toContainEqual({ botId: 'cli_a', project: 'demo', policy });
+    }
+  });
   it('accepts model-only and Fast-only history settings without changing its switch', async () => {
     for (const body of [{ model: 'gpt-5.6-sol' }, { fast: true }]) {
       const res = await fetch(`${writeBase}/api/project/demo/context-briefing?bot=cli_a`, {

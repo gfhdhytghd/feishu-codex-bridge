@@ -2233,7 +2233,7 @@ ${UI_PURE_JS}
       meta.appendChild(el('span', 'tag ' + (p.mode === 'full' ? 'orange' : 'green'), '🔐 ' + permissionSummary(p)));
       meta.appendChild(el('span', 'tag blue', '🧠 ' + p.backend));
       meta.appendChild(el('span', 'tag', '🧵 ' + p.sessionCount + ' 话题'));
-      meta.appendChild(el('span', 'tag', '✋ 免@：' + (p.noMention ? '开' : '关')));
+      meta.appendChild(el('span', 'tag', 'AI 参与策略：' + ({ all: '回复全部消息', model: '模型自行决定回复', mention: '只回复被 @ 的消息' }[p.participation])));
       item.appendChild(meta);
       item.appendChild(el('div', 'path', '📂 ' + p.cwd));
       var ops = el('div', 'statline');
@@ -2331,16 +2331,11 @@ ${UI_PURE_JS}
     d.appendChild(el('div', 'note', '后端在新建项目时选定，运行时固定、不支持切换。如需更改，请删除该项目后用新后端重新创建。'));
     d.appendChild(el('hr', 'hr'));
 
-    // ✋ 免@
-    d.appendChild(el('div', null, '✋ 免@（不用 @ 也回复）'));
-    d.appendChild(optButtons(
-      [{ label: '开', value: 'on' }, { label: '关', value: 'off' }],
-      p.noMention ? 'on' : 'off',
-      function (v) { postWrite('/api/project/' + encodeURIComponent(p.name) + '/no-mention', { on: v === 'on' }); }
-    ));
-    d.appendChild(el('div', 'note', p.kind === 'single'
-      ? '开启后：本群所有消息(不用 @)都交给机器人处理。'
-      : '开启后：话题内消息(不用 @)都处理；开新话题仍需 @机器人。'));
+    d.appendChild(el('div', null, 'AI 参与策略'));
+    var participationOptions = [{ label: '回复全部消息', value: 'all' }, { label: '模型自行决定回复', value: 'model' }, { label: '只回复被 @ 的消息', value: 'mention' }];
+    if (p.kind !== 'single' || (p.backend && p.backend !== 'codex-appserver')) participationOptions = participationOptions.filter(function (o) { return o.value !== 'model'; });
+    d.appendChild(optButtons(participationOptions, p.participation, function (v) { postWrite('/api/project/' + encodeURIComponent(p.name) + '/participation', { policy: v }); }));
+    d.appendChild(el('div', 'note', '模型自行决定回复目前支持 Codex 单会话群；消息简史独立设置。'));
     d.appendChild(el('hr', 'hr'));
 
     // 🗜️ 自动压缩
@@ -2376,13 +2371,6 @@ ${UI_PURE_JS}
       function (v) { postWrite('/api/project/' + encodeURIComponent(p.name) + '/context-briefing', { fast: v === 'on' }); }));
     d.appendChild(el('hr', 'hr'));
 
-    if (p.kind === 'single' && (!p.backend || p.backend === 'codex-appserver')) {
-      d.appendChild(el('div', null, 'Discuss · 群聊参与判断'));
-      d.appendChild(optButtons([{ label: '开', value: 'on' }, { label: '关', value: 'off' }], p.discuss ? 'on' : 'off',
-        function (v) { postWrite('/api/project/' + encodeURIComponent(p.name) + '/discuss', { on: v === 'on' }); }));
-      d.appendChild(el('div', 'note', '普通群消息先判断是否回复或引导当前任务；@直接处理。消息简史独立设置，关闭判断后恢复原免@设置。'));
-      d.appendChild(el('hr', 'hr'));
-    }
     // 🧵 话题
     d.appendChild(el('div', null, '🧵 话题 · 共 ' + p.sessionCount + ' 个'));
     var topicBox = el('div', 'note', '加载中…');

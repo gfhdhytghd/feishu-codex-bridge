@@ -5,7 +5,10 @@ import { paths } from '../config/paths';
 import type { PermissionMode, ReasoningEffort } from '../agent/types';
 
 /** A project = a Feishu group bound to a fixed working directory. */
+export type ParticipationPolicy = 'all' | 'model' | 'mention';
+
 export interface Project {
+  participation?: ParticipationPolicy;
   /** unique project name (also the group name) */
   name: string;
   /** the bound Feishu group chat_id (oc_xxx) */
@@ -234,4 +237,17 @@ export async function removeProject(name: string): Promise<Project | undefined> 
     await write(projects);
     return removed;
   });
+}
+
+/** Legacy settings migrate on read; an explicit policy always takes precedence. */
+export function participationPolicy(p: Pick<Project, 'participation' | 'discuss' | 'noMention' | 'kind' | 'origin'>): ParticipationPolicy {
+  return p.participation ?? (p.discuss ? 'model' : (p.noMention ?? defaultNoMention(p)) ? 'all' : 'mention');
+}
+export const PARTICIPATION_OPTIONS = [
+  { label: '回复全部消息', value: 'all' },
+  { label: '模型自行决定回复', value: 'model' },
+  { label: '只回复被 @ 的消息', value: 'mention' },
+];
+export function participationLabel(p: Pick<Project, 'participation' | 'discuss' | 'noMention' | 'kind' | 'origin'>): string {
+  return PARTICIPATION_OPTIONS.find(o => o.value === participationPolicy(p))!.label;
 }

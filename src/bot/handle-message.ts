@@ -28,7 +28,7 @@ import {
   performBackendSwitch,
   performSetAutoCompact,
   performSetContextBriefing,
-  performSetDiscuss,
+  performSetDiscuss, performSetParticipation,
   performSetCompletionReminder,
   performSetModelDefault,
   performSetNoMention,
@@ -184,7 +184,7 @@ import { getSecret } from '../config/keystore';
 import { buildScopeGrantUrl, JOIN_GROUP_SCOPES } from '../config/scopes';
 import { validateAppCredentials } from '../utils/feishu-auth';
 import {
-  defaultNoMention,
+  participationPolicy, type ParticipationPolicy,
   getProjectByChatId,
   getProjectByName,
   listProjects,
@@ -673,7 +673,7 @@ export function createOrchestrator(
     new ChatHistory(channel, contextConfig.archivePath, contextConfig.pythonCommand), contextConfig,
     `${paths.sessionsFile}.context.json`,
   ) : undefined;
-  const discussEnabled = (p: Project | undefined): boolean => p?.discuss === true && p.kind === 'single' && (!p.backend || p.backend === DEFAULT_BACKEND_ID);
+  const discussEnabled = (p: Project | undefined): boolean => !!p && participationPolicy(p) === 'model' && p.kind === 'single' && (!p.backend || p.backend === DEFAULT_BACKEND_ID);
   const resolvingThreads = new Map<string, Promise<{ thread: AgentThread | undefined; recreated: boolean }>>();
   const resolutionEpochs = new Map<string, number>();
   const resolutionChats = new Map<string, string>();
@@ -1329,7 +1329,8 @@ export function createOrchestrator(
    * 即使开了免@，若消息 @了所有人 或 @了具体的(非机器人)用户,说明是定向给别人的,
    * bot 不插话。(此函数仅在 !mentionedBot 时调用,故 @到 bot 的情况已被排除。) */
   function shouldRespondWithoutMention(project: Project, msg: NormalizedMessage): boolean {
-    if (!(project.noMention ?? defaultNoMention(project))) return false;
+    if (!(participationPolicy(project) === 'all')) return false;
+    if (project.participation === 'all') return true;
     if (msg.mentionAll || msg.mentions.some((m) => !m.isBot)) return false;
     if ((project.kind ?? 'multi') === 'single') return true;
     const content = msg.content.trim();
@@ -2396,7 +2397,7 @@ export function createOrchestrator(
     inThread = false,
     project?: Project,
   ): Promise<void> {
-    const noMention = project ? (project.noMention ?? defaultNoMention(project)) : true;
+    const noMention = project ? (participationPolicy(project) === 'all') : true;
     // 按本群项目的后端能力裁剪命令清单：不支持的后端不列 /goal、/compact、/resume
     // （能力守卫会拒），避免「列了点了才发现不支持」。codex(capabilities undefined)=全列。
     const caps = backendFor(project?.backend).capabilities;
@@ -3806,6 +3807,15 @@ export function createOrchestrator(
         return buildGroupSettingsCard({ name: '本群', kind: 'multi', noMention: on });
       });
     })
+    .on(GS.setParticipation, ({ evt, value }) => {
+      if (!isAdmin(cfg, evt.operator?.openId ?? '')) return;
+      patch(evt, async () => {
+        const p = await getProjectByChatId(evt.chatId);
+        if (!p) return buildGroupSettingsCard({ name: '本群', kind: 'multi' });
+        const result = await performSetParticipation({ projectName: p.name, policy: value.v as ParticipationPolicy });
+        return buildGroupSettingsCard(result.ok ? result.project : p);
+      });
+    })
     .on(GS.setDiscuss, ({ evt, value }) => {
       if (!isAdmin(cfg, evt.operator?.openId ?? '') || !['on', 'off'].includes(String(value.v))) return;
       patch(evt, async () => {
@@ -4020,6 +4030,15 @@ export function createOrchestrator(
         const r = await performSetNoMention({ projectName: name, on });
         if (!r.ok) return buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
         return buildProjectSettingsCard(r.project, backendDisplayName(r.project.backend));
+      });
+    })
+    .on(DM.setParticipationDm, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      patch(evt, async () => {
+        const p = await getProjectByName(String(value.n ?? ''));
+        if (!p) return buildDmMenuCard({});
+        const result = await performSetParticipation({ projectName: p.name, policy: value.v as ParticipationPolicy });
+        return buildProjectSettingsCard(result.ok ? result.project : p, backendDisplayName(p.backend));
       });
     })
     .on(DM.setDiscussDm, ({ evt, value }) => {

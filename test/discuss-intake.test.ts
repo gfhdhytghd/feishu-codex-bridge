@@ -9,6 +9,7 @@ const fake = vi.hoisted(() => ({
   backend: { id: 'codex-appserver', listModels: vi.fn(async () => []), resumeThread: vi.fn(), startThread: vi.fn() },
   evict: undefined as undefined | ((chat: string) => Promise<void>),
   discuss: true,
+  participation: undefined as undefined | 'all' | 'model' | 'mention',
   action: 'FOLLOW_UP',
   judgeCalls: 0,
   judgeGate: undefined as Promise<void> | undefined,
@@ -28,7 +29,7 @@ vi.mock('../src/core/logger', () => ({ log: fake.log, withTrace: (_ctx: unknown,
 vi.mock('../src/agent', async (original) => ({ ...await original<object>(), createBackend: () => fake.backend }));
 vi.mock('../src/project/registry', async (original) => ({
   ...await original<object>(),
-  getProjectByChatId: async () => ({ name: 'test', chatId: 'chat', cwd: '/test', kind: 'single', discuss: fake.discuss, noMention: false }),
+  getProjectByChatId: async () => ({ name: 'test', chatId: 'chat', cwd: '/test', kind: 'single', discuss: fake.discuss, participation: fake.participation, noMention: false }),
 }));
 vi.mock('../src/bot/session-store', async (original) => ({
   ...await original<object>(),
@@ -98,7 +99,7 @@ function setup(policy: 'steer' | 'queue' = 'steer') {
   return orchestrator;
 }
 beforeEach(() => {
-  vi.clearAllMocks(); fake.discuss = true; fake.action = 'FOLLOW_UP'; fake.judgeCalls = 0; fake.judgeGate = undefined;
+  vi.clearAllMocks(); fake.participation = undefined; fake.discuss = true; fake.action = 'FOLLOW_UP'; fake.judgeCalls = 0; fake.judgeGate = undefined;
   fake.final.mockReset().mockResolvedValue(true);
   fake.createCard.mockReset().mockResolvedValue('card');
   fake.send.mockReset().mockResolvedValue({});
@@ -216,4 +217,17 @@ it('retries a definitive Discuss STEER rejection instead of stranding unknown', 
   await o.onMessage({ ...message('correction'), mentionedBot: false });
   await vi.waitFor(() => expect(run.t.steer).toHaveBeenCalledTimes(2), { timeout: 3500 });
   run.turns[0]!.resolve();
+});
+
+
+it.each(['all', 'model', 'mention'] as const)('routes ordinary messages according to explicit %s policy despite legacy discuss=true', async policy => {
+  fake.participation = policy;
+  const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
+  const o = setup(); const pending = o.onMessage({ ...message('please review'), mentionedBot: false });
+  if (policy === 'mention') { await pending; expect(run.consumed).toHaveLength(0); expect(fake.judgeCalls).toBe(0); }
+  else {
+    await vi.waitFor(() => expect(run.consumed).toHaveLength(1), { timeout: 3500 });
+    expect(fake.judgeCalls).toBe(policy === 'model' ? 1 : 0);
+    run.turns[0]!.resolve(); await pending;
+  }
 });
