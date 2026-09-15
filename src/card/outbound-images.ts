@@ -18,7 +18,7 @@ import { log } from '../core/logger';
  * skipped — the original markdown text stays in place, never throwing.
  */
 
-/** Cap per reply so a flood of refs can't wedge a turn or hammer the upload API. */
+/** Cap each streaming/final-answer pass so a flood cannot hammer the upload API. */
 const MAX_IMAGES = 9;
 /** Feishu rejects uploads over 10MB (and 0-byte files). */
 const MAX_BYTES = 10 * 1024 * 1024;
@@ -223,5 +223,18 @@ export class StreamingImages {
 
   async drain(): Promise<void> {
     while (this.pending.size) await Promise.all(this.pending);
+  }
+
+  /** Final-answer refs get their own bounded pass, even if progress messages
+   * used the streaming budget. Merge rather than replace: images already shown
+   * during the turn must remain visible in the terminal process panel. */
+  async finalize(finalAnswer: string): Promise<ReadonlyMap<string, string>> {
+    await this.drain();
+    const sources = imageSources(finalAnswer).slice(0, MAX_IMAGES);
+    if (sources.length) {
+      const uploaded = await this.upload(sources);
+      for (const [src, key] of uploaded) this.images.set(src, key);
+    }
+    return this.images;
   }
 }

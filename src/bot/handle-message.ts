@@ -106,7 +106,7 @@ import {
 import { buildGoalDoneCard } from '../card/goal-card';
 import { RunCardStream } from '../card/run-card-stream';
 import { buildCleanCard, extractCardFences } from '../card/markdown-render';
-import { imageSources, uploadOutboundImages, StreamingImages } from '../card/outbound-images';
+import { uploadOutboundImages, StreamingImages } from '../card/outbound-images';
 import {
   buildAutoCompactCard,
   buildCompactFailedCard,
@@ -4920,10 +4920,7 @@ export function createOrchestrator(
           // retry failures once, and extract standalone clean-card fences.
           const answerText = finalMessageText(rc.rs);
           const { fences } = extractCardFences(answerText);
-          const imgSources = imageSources(answerText);
-          if (imgSources.length > 0) {
-            rc.images = await uploadRunImages(opts, imgSources, state.requesterOpenId);
-          }
+          rc.images = await liveImages.finalize(answerText);
 
           // terminal whole-card update: final render with streaming off (clears the
           // typewriter cursor) and no ⏹ button. Remove the callback before freezing
@@ -5205,7 +5202,10 @@ export function createOrchestrator(
       await ctx.stream.drain();
       ctx.render.finalize();
       ctx.rc.rs = ctx.render.snapshot();
-      await ctx.stream.updateCard(channel, buildRunCard(ctx.rc));
+      if (ctx.stream.imageWorker) {
+        ctx.rc.images = await ctx.stream.imageWorker.uploads.finalize(finalMessageText(ctx.rc.rs));
+      }
+      await ctx.stream.finalizeCard(channel, buildRunCard(ctx.rc));
       runsByCard.delete(ctx.cardMsgId);
       promoteCard(ctx.cardMsgId, ctx.rc);
     };
