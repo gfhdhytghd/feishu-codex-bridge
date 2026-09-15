@@ -1,9 +1,9 @@
-import { JsonRpcError } from '../src/agent/codex-appserver/app-server-client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import type { AgentEvent, AgentInput } from '../src/agent/types';
 
 const fake = vi.hoisted(() => ({
+  mode: 'full' as 'full' | 'qa',
   transcribe: vi.fn(),
   backend: { id: 'codex', listModels: vi.fn(async () => []), resumeThread: vi.fn(), startThread: vi.fn() },
   final: vi.fn(async () => true),
@@ -16,11 +16,14 @@ vi.mock('../src/core/logger', () => ({ log: fake.log, withTrace: (_ctx: unknown,
 vi.mock('../src/agent', async (original) => ({ ...await original<object>(), createBackend: () => fake.backend }));
 vi.mock('../src/project/registry', async (original) => ({
   ...await original<object>(),
-  getProjectByChatId: async () => ({ name: 'test', chatId: 'chat', cwd: '/test', groupMode: 'single' }),
+  getProjectByChatId: async () => ({ name: 'test', chatId: 'chat', cwd: '/test', kind: 'single', mode: fake.mode }),
+  getProjectByName: async () => ({ name: 'test', chatId: 'chat', cwd: '/test', kind: 'single', mode: fake.mode }),
+  updateProject: async (_name: string, patch: { mode?: 'full' | 'qa' }) => { if (patch.mode) fake.mode = patch.mode; },
 }));
 vi.mock('../src/bot/session-store', async (original) => ({
   ...await original<object>(),
   getSession: async () => ({ threadId: 'topic', chatId: 'chat', sessionId: 'host', backend: 'codex', cwd: '/test', summary: '' }),
+  listSessions: async () => [],
   patchSession: async () => undefined,
   upsertSession: async () => undefined,
 }));
@@ -86,6 +89,7 @@ function setup(policy: 'steer' | 'queue' = 'steer') {
 }
 beforeEach(() => {
   vi.clearAllMocks();
+  fake.mode = 'full';
   fake.final.mockReset().mockResolvedValue(true);
   fake.createCard.mockReset().mockResolvedValue('card');
   fake.send.mockReset().mockResolvedValue({});
@@ -149,5 +153,52 @@ describe('voice queue integration', () => {
     await o.shutdown(); pending.resolve('语音消息：迟到结果');
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(run.consumed).toHaveLength(0);
+  });
+});
+
+describe('voice preparation lifecycle', () => {
+  it('rejects a stale permission snapshot even if the registry changes outside eviction', async () => {
+    const pending = deferred<string>(); fake.transcribe.mockReturnValue(pending.promise);
+    const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
+    const o = setup(); await o.onMessage(voice());
+    await until(() => expect(fake.transcribe).toHaveBeenCalled());
+    fake.mode = 'qa';
+    pending.resolve('语音消息：旧权限命令');
+    await until(() => expect(fake.send.mock.calls.some(call => JSON.stringify(call).includes('项目权限或会话设置已变更'))).toBe(true));
+    expect(fake.backend.resumeThread).not.toHaveBeenCalled();
+    expect(run.consumed).toHaveLength(0);
+    await o.onMessage(message('new request'));
+    await until(() => expect(run.consumed).toHaveLength(1));
+    expect(fake.backend.resumeThread).toHaveBeenCalledWith(expect.objectContaining({ mode: 'qa' }));
+  });
+
+  it('permission eviction cancels unloaded preparation lanes and their later text', async () => {
+    const pending = deferred<string>(); fake.transcribe.mockReturnValue(pending.promise);
+    const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
+    const o = setup(); await o.onMessage(voice()); await o.onMessage(message('old later text'));
+    await until(() => expect(fake.transcribe).toHaveBeenCalled());
+    await o.adminExecute({ kind: 'setPermissionMode', project: 'test', mode: 'qa' });
+    expect(fake.transcribe.mock.calls[0]![2].aborted).toBe(true);
+    pending.resolve('语音消息：旧权限命令');
+    await o.onMessage(message('new request'));
+    await until(() => expect(run.consumed).toHaveLength(1));
+    expect(run.consumed[0]!.text).toContain('new request');
+    expect(fake.backend.resumeThread).toHaveBeenCalledWith(expect.objectContaining({ mode: 'qa' }));
+    expect(fake.log.info.mock.calls.some(call => call[1] === 'queued')).toBe(false);
+  });
+
+  it('clear aborts pending ASR and old text before binding a replacement session', async () => {
+    const pending = deferred<string>(); fake.transcribe.mockReturnValue(pending.promise);
+    const fresh = thread(); fresh.t.sessionId = 'fresh'; fake.backend.startThread.mockResolvedValue(fresh.t);
+    const o = setup(); await o.onMessage(voice()); await o.onMessage(message('old later text'));
+    await until(() => expect(fake.transcribe).toHaveBeenCalled());
+    await o.onMessage(message('/clear'));
+    expect(fake.transcribe.mock.calls[0]![2].aborted).toBe(true);
+    await until(() => expect(fake.log.info).toHaveBeenCalledWith('intake', 'clear', expect.anything()));
+    pending.resolve('语音消息：清空前旧命令');
+    await o.onMessage(message('new request'));
+    await until(() => expect(fresh.consumed).toHaveLength(1));
+    expect(fresh.consumed[0]!.text).toContain('new request');
+    expect(fake.log.info.mock.calls.some(call => call[1] === 'queued')).toBe(false);
   });
 });
