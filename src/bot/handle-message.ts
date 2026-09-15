@@ -1489,6 +1489,7 @@ export function createOrchestrator(
     perm: TurnPerm,
     prepared?: { text: string; images?: string[]; receipt: ContextReceipt; signal?: AbortSignal },
     voicePrepared = false,
+    preparationSignal?: AbortSignal,
   ): Promise<void> {
     if (prepared?.signal?.aborted) { finishEarly(msg); prepared.receipt.rejected(); return; }
     // Reserve an ordered preparation lane before starting ASR. Later messages
@@ -1497,14 +1498,26 @@ export function createOrchestrator(
       if (active.get(sessionKey)?.isGoal) { await replyGoalBusy(msg, flat); return; }
       contextTargets.set(sessionKey, msg);
       voiceQueued.add(msg);
+      // Compare immutable intake policy with live policy after slow ASR. Do not
+      // carry a previous tier/session namespace into a changed project.
+      const policy = (p: Project | undefined) => JSON.stringify({
+        name: p?.name, cwd: p?.cwd, backend: p?.backend, kind: p?.kind,
+        ...turnPerm(p, msg.senderId),
+      });
+      const intakePolicy = policy(project);
       voiceIntake.submit(sessionKey, async signal => {
         const body = messageHasVoice(msg) ? await voiceText(msg, signal) : text;
         signal.throwIfAborted();
         return { body, signal };
       }, async ({ body, signal }) => {
+        const fresh = await getProjectByChatId(msg.chatId);
         if (signal.aborted) return;
-        await handleTurn(msg, body, sessionKey, flat, project, perm, undefined, true);
-      }, err => voiceFailed(msg, flat, err));
+        if (!fresh || !isChatAllowed(cfg, msg.chatId) || !isUserAllowedInProject(cfg, fresh, msg.senderId)
+          || policy(fresh) !== intakePolicy) {
+          throw new VoiceError('项目权限或会话设置已变更，请重发');
+        }
+        await handleTurn(msg, body, sessionKey, flat, fresh, turnPerm(fresh, msg.senderId), undefined, true, signal);
+      }, err => voiceFailed(msg, flat, err), msg.chatId);
       return;
     }
     if (discussEnabled(project) && !prepared) {
@@ -1579,6 +1592,7 @@ export function createOrchestrator(
       // Download file attachments too and weave their paths into the text (codex
       // reads them by path). Both awaits happen before re-reading the session.
       const woven = prepared?.text ?? await ingestContext(msg, text);
+      if (preparationSignal?.aborted) return;
       // The turn may have finished while media downloaded — re-read the session.
       // If it's gone, start a fresh run (carrying what we already fetched).
       const cur = active.get(sessionKey);
@@ -2003,6 +2017,10 @@ export function createOrchestrator(
   async function evictLiveSessionsForChat(chatId: string): Promise<void> {
     for (const [key, msg] of contextTargets) if (msg.chatId === chatId) cancelContext(key);
     for (const [key, chat] of resolutionChats) if (chat === chatId) invalidateResolution(key);
+    const cancelled = voiceIntake.cancelScope(chatId);
+    if (cancelled) void channel.send(chatId, {
+      markdown: `⚠️ 项目设置已变更，${cancelled} 条等待语音处理的消息已取消，请重发。`,
+    }).catch(() => undefined);
     let closed = 0;
     for (const rec of await listSessions()) {
       if (rec.chatId !== chatId) continue;
@@ -4247,6 +4265,10 @@ export function createOrchestrator(
         // long await, and a message racing in during it must NOT start a turn we
         // then evict out from under. Held until the rebind settles; released in
         // finally, with a notice for anything that queued and never ran.
+        const cancelled = voiceIntake.cancel(sessionKey);
+        if (cancelled) void channel.send(state.chatId, {
+          markdown: `⚠️ 切换会话已取消 ${cancelled} 条等待语音处理的消息，请重发。`,
+        }, { replyTo: state.originalMsgId }).catch(() => undefined);
         const reserved: ActiveState = { queue: [], requesterOpenId: state.requesterOpenId };
         cancelContext(sessionKey);
         active.set(sessionKey, reserved);

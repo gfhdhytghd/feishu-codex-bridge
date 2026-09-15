@@ -3,14 +3,14 @@
  * A cancelled generation can
  * never deliver into a replacement session, even if its work ignores abort. */
 export class VoiceIntake {
-  private lanes = new Map<string, { tail: Promise<void>; jobs: Set<AbortController> }>();
+  private lanes = new Map<string, { tail: Promise<void>; jobs: Set<AbortController>; scope?: string }>();
   private closed = false;
 
   submit<T>(key: string, work: (signal: AbortSignal) => Promise<T>, deliver: (value: T) => Promise<void>,
-    failed: (error: unknown) => void): void {
+    failed: (error: unknown) => void, scope?: string): void {
     if (this.closed) return;
     let lane = this.lanes.get(key);
-    if (!lane) { lane = { tail: Promise.resolve(), jobs: new Set() }; this.lanes.set(key, lane); }
+    if (!lane) { lane = { tail: Promise.resolve(), jobs: new Set(), scope }; this.lanes.set(key, lane); }
     const owner = lane;
     const controller = new AbortController();
     owner.jobs.add(controller);
@@ -36,6 +36,13 @@ export class VoiceIntake {
     this.lanes.delete(key);
     const count = lane.jobs.size;
     for (const job of lane.jobs) job.abort();
+    return count;
+  }
+
+  /** Cancel every preparation lane belonging to a chat, including unloaded sessions. */
+  cancelScope(scope: string): number {
+    let count = 0;
+    for (const [key, lane] of this.lanes) if (lane.scope === scope) count += this.cancel(key);
     return count;
   }
 
