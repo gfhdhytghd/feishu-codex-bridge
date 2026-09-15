@@ -1,3 +1,5 @@
+import { realpathSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { log } from '../../core/logger';
 import type {
   AgentBackend,
@@ -73,6 +75,7 @@ export function withAutoCompact(
 export function sandboxParams(
   mode: PermissionMode | undefined,
   network: boolean | undefined,
+  runtimeBin?: string | null,
 ): Record<string, unknown> {
   if ((mode ?? 'full') === 'full') return { sandbox: 'danger-full-access' };
   if (process.platform !== 'darwin' && process.platform !== 'win32') {
@@ -80,12 +83,20 @@ export function sandboxParams(
       '「项目内只读 / 项目内读写」靠操作系统沙箱把读写锁进项目文件夹，目前只有 macOS 与原生 Windows 能强制执行。当前平台（Linux / WSL 只挡写、不限制读取，无法保证不泄露隐私）已拒绝启动（绝不降级为完全访问）。请改用「完全访问」、把 Codex 跑进容器/隔离环境，或在 macOS / Windows 上运行。',
     );
   }
+  // Seatbelt must read both the launcher directory and its resolved runtime
+  // directory before exec. Exact-file rules alone fail with Homebrew symlinks.
+  const runtimeReads: Record<string, 'read'> = {};
+  if (process.platform === 'darwin' && runtimeBin) {
+    runtimeReads[dirname(runtimeBin)] = 'read';
+    runtimeReads[dirname(realpathSync(runtimeBin))] = 'read';
+  }
   return {
     config: {
       default_permissions: 'feishu',
       permissions: {
         feishu: {
           filesystem: {
+            ...runtimeReads,
             ':minimal': 'read',
             ':workspace_roots': { '.': mode === 'write' ? 'write' : 'read' },
           },
@@ -643,7 +654,7 @@ export class CodexAppServerBackend implements AgentBackend {
   async startThread(opts: StartThreadOptions): Promise<AgentThread> {
     // Build sandbox params first — the platform fail-closed guard throws here,
     // before we spawn, so a rejected tier leaves no orphan app-server process.
-    const sandbox = withAutoCompact(sandboxParams(opts.mode, opts.network), opts.autoCompact);
+    const sandbox = withAutoCompact(sandboxParams(opts.mode, opts.network, resolveCodexBin()), opts.autoCompact);
     const client = await this.spawn(opts.cwd);
     const res = await client.request<{ thread: { id: string } }>('thread/start', {
       cwd: opts.cwd,
@@ -656,7 +667,7 @@ export class CodexAppServerBackend implements AgentBackend {
   }
 
   async resumeThread(opts: ResumeThreadOptions): Promise<AgentThread> {
-    const sandbox = withAutoCompact(sandboxParams(opts.mode, opts.network), opts.autoCompact);
+    const sandbox = withAutoCompact(sandboxParams(opts.mode, opts.network, resolveCodexBin()), opts.autoCompact);
     const client = await this.spawn(opts.cwd);
     const res = await client.request<{ thread: { id: string } }>('thread/resume', {
       threadId: opts.sessionId,

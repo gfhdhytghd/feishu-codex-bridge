@@ -1,3 +1,6 @@
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, dirname } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { effectiveGuestMode, effectiveMode, turnTier } from '../src/project/registry';
 import { sandboxParams, withAutoCompact } from '../src/agent/codex-appserver/backend';
@@ -84,6 +87,30 @@ describe('sandboxParams', () => {
       });
     });
   }
+
+  it('macOS retains launcher and resolved runtime reads without granting writes', () => {
+    const root = mkdtempSync(join(tmpdir(), 'bridge-runtime-test-'));
+    try {
+      const launcher = join(root, 'bin', 'codex');
+      const runtime = join(root, 'runtime', 'codex');
+      mkdirSync(dirname(launcher));
+      mkdirSync(dirname(runtime));
+      writeFileSync(runtime, 'test runtime');
+      symlinkSync(runtime, launcher);
+      withPlatform('darwin', () => {
+        const p = sandboxParams('qa', false, launcher) as any;
+        const fs = p.config.permissions.feishu.filesystem;
+        expect(fs[dirname(launcher)]).toBe('read');
+        // macOS realpath resolves /var to /private/var.
+        expect(Object.values(fs).filter((v) => v === 'read')).toHaveLength(3);
+        expect(fs[':workspace_roots']['.']).toBe('read');
+        expect(fs[':root']).toBeUndefined();
+        expect(p.config.permissions.feishu.network.enabled).toBe(false);
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 
   it('fail-closed on Linux/WSL: qa/write throw (reads not confined there), full still works', () => {
     withPlatform('linux', () => {
