@@ -36,6 +36,7 @@ function stubService(): AdminService {
           origin: 'created' as const,
           noMention: true,
           autoCompact: true,
+          contextBriefing: true,
           mode: 'full' as const,
           guestMode: 'full' as const,
           network: false,
@@ -58,6 +59,7 @@ function stubService(): AdminService {
     async setNoMention() {
       throw new NotWiredYetError('✋ 免@ 开关');
     },
+    async setContextBriefing() { throw new NotWiredYetError('上下文策略'); },
     async setAutoCompact() {
       throw new NotWiredYetError('🗜️ 自动压缩开关');
     },
@@ -378,7 +380,7 @@ describe('web server · 只读 API', () => {
 });
 
 describe('web server · 写操作占位（只读预览：daemon 未跑）', () => {
-  it.each(['backend', 'permission', 'no-mention', 'auto-compact'])('POST /api/project/demo/%s → 501', async (action) => {
+  it.each(['backend', 'permission', 'no-mention', 'auto-compact', 'context-briefing'])('POST /api/project/demo/%s → 501', async (action) => {
     const res = await authed(`/api/project/demo/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -393,6 +395,12 @@ describe('web server · 写操作占位（只读预览：daemon 未跑）', () =
   it('写操作同样要鉴权：无 token → 401（不是 501）', async () => {
     const res = await get('/api/project/demo/backend', { method: 'POST', body: '{}' });
     expect(res.status).toBe(401);
+  });
+  it('requires authentication and a boolean for context strategy writes', async () => {
+    expect((await get('/api/project/demo/context-briefing', { method: 'POST', body: '{"on":false}' })).status).toBe(401);
+    const response = await authed('/api/project/demo/context-briefing', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: '{"on":"false"}' });
+    expect(response.status).toBe(400);
   });
 
   it('POST /api/bots/:id/completion-reminder 在只读预览 → 501', async () => {

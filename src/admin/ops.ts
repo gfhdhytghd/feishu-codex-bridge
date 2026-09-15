@@ -47,6 +47,7 @@ export type AdminWriteOp =
     }
   | { kind: 'setNoMention'; project: string; on: boolean }
   | { kind: 'setAutoCompact'; project: string; on: boolean }
+  | { kind: 'setContextBriefing'; project: string; on: boolean }
   | {
       kind: 'setCompletionReminder';
       mode: CompletionReminderMode;
@@ -270,6 +271,15 @@ export async function performSetNoMention(opts: { projectName: string; on: boole
   return { ok: true, project: await freshOr(opts.projectName, { ...p, noMention: opts.on }) };
 }
 
+/** Per-project briefing policy, read at intake; never interrupts a live turn. */
+export async function performSetContextBriefing(opts: { projectName: string; on: boolean }): Promise<AdminWriteOutcome> {
+  if (typeof opts.on !== 'boolean') return { ok: false, reason: '上下文策略开关必须是布尔值' };
+  const p = await getProjectByName(opts.projectName);
+  if (!p) return { ok: false, reason: `项目「${opts.projectName}」不存在` };
+  await updateProject(opts.projectName, { contextBriefing: opts.on });
+  return { ok: true, project: await freshOr(opts.projectName, { ...p, contextBriefing: opts.on }) };
+}
+
 /** 🗜️ 自动压缩开关（DM dm.proj.autoCompact / gs.autoCompact 与 Web 同源）：
  * 压缩上限在 thread/start 绑定，落盘后驱逐活跃会话让下一条消息重绑生效。 */
 export async function performSetAutoCompact(opts: {
@@ -388,6 +398,8 @@ export async function runAdminWriteOp(
       });
     case 'setNoMention':
       return performSetNoMention({ projectName: op.project, on: op.on });
+    case 'setContextBriefing':
+      return performSetContextBriefing({ projectName: op.project, on: op.on });
     case 'setAutoCompact':
       return performSetAutoCompact({
         projectName: op.project,

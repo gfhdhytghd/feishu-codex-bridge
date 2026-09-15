@@ -91,6 +91,15 @@ export interface AppAccess {
 }
 
 export interface AppPreferences {
+  /** Question-conditioned, current-chat context. Configured even when disabled
+   * to retain scoped raw-history fallback instead of legacy global memory. */
+  contextBriefing?: {
+    enabled?: boolean;
+    model?: string;
+    timeoutMs?: number;
+    archivePath?: string;
+    pythonCommand?: string;
+  };
   /** 空白项目的默认父目录。仅通过 config.json 配置；缺省时仍使用
    * `~/.feishu-codex-bridge/projects`。支持绝对路径或 `~` 开头的路径。 */
   projectsRootDir?: string;

@@ -2353,6 +2353,15 @@ ${UI_PURE_JS}
     d.appendChild(el('div', 'note', '开启后：上下文接近上限时 Codex 自动总结早前对话、释放空间（默认开）。'));
     d.appendChild(el('hr', 'hr'));
 
+    d.appendChild(el('div', null, '🧠 消息简史'));
+    d.appendChild(optButtons(
+      [{ label: '开', value: 'on' }, { label: '关', value: 'off' }],
+      p.contextBriefing !== false ? 'on' : 'off',
+      function (v) { postWrite('/api/project/' + encodeURIComponent(p.name) + '/context-briefing', { on: v === 'on' }); }
+    ));
+    d.appendChild(el('div', 'note', '开启时使用所选模型整理消息；关闭时直接提供原文。'));
+    d.appendChild(el('hr', 'hr'));
+
     // 🧵 话题
     d.appendChild(el('div', null, '🧵 话题 · 共 ' + p.sessionCount + ' 个'));
     var topicBox = el('div', 'note', '加载中…');

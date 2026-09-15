@@ -27,6 +27,7 @@ import {
   createAdminWriteExecutor,
   performBackendSwitch,
   performSetAutoCompact,
+  performSetContextBriefing,
   performSetCompletionReminder,
   performSetModelDefault,
   performSetNoMention,
@@ -66,6 +67,10 @@ import {
   type PendingPolicy,
   type SessionTitleBackendConfig,
 } from '../config/schema';
+import { weaveMemoryContext } from './context-format';
+import { ContextBriefing, type ContextReceipt } from './context-briefing';
+import { ChatHistory } from './briefing-history';
+import { OrderedPreparation } from './ordered-preparation';
 import { CardDispatcher } from '../card/dispatcher';
 import { sendManagedCard, updateManagedCard } from '../card/managed';
 import { RunRender } from '../card/run-render';
@@ -659,6 +664,11 @@ export function createOrchestrator(
   fallbackCwd: string,
   cliBridge?: CliBridgeRuntimeHooks,
 ): Orchestrator {
+  const contextConfig = cfg.preferences?.contextBriefing;
+  const briefings = contextConfig ? new ContextBriefing(
+    new ChatHistory(channel, contextConfig.archivePath, contextConfig.pythonCommand), contextConfig,
+    `${paths.sessionsFile}.context.json`,
+  ) : undefined;
   const voiceShutdown = new AbortController();
   const voiceIntake = new VoiceIntake();
   const voiceQueued = new WeakSet<NormalizedMessage>();
@@ -677,6 +687,20 @@ export function createOrchestrator(
     void channel.send(msg.chatId, { markdown: `❌ ${detail}。本条语音未提交给模型。` },
       { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
   }
+  const contextIntake = new OrderedPreparation();
+  const contextTargets = new Map<string, NormalizedMessage>();
+  const cancelContext = (key: string): void => {
+    briefings?.cancel(key);
+    const count = contextIntake.cancel(key) + voiceIntake.cancel(key);
+    const target = contextTargets.get(key);
+    contextTargets.delete(key);
+    if (count && target) void channel.send(target.chatId,
+      { markdown: `⚠️ ${count} 条尚未提交的消息已取消，请按需重发。` },
+      { replyTo: target.messageId, replyInThread: Boolean(target.threadId) }).catch(() => undefined);
+  };
+  const cancelStateContext = (state: ActiveState): void => {
+    for (const [key, value] of active) if (value === state) cancelContext(key);
+  };
   /** Lazily-constructed backends by id — one instance per backend for the whole
    * bridge (mirrors the old single-instance shape; codex stays the default). */
   const backends = new Map<string, AgentBackend>();
@@ -931,6 +955,7 @@ export function createOrchestrator(
     }
 
     const project = await getProjectByChatId(msg.chatId);
+    if (project && isChatAllowed(cfg, msg.chatId) && isUserAllowedInProject(cfg, project, msg.senderId)) briefings?.observe(msg);
     // @门：没 @ 时只在「项目群 + 免@ 适用」才响应。免@默认开,但 multi 仅话题内、
     // single 整群;非项目群一律不响应非 @ 消息。
     if (!msg.mentionedBot && !(project && shouldRespondWithoutMention(project, msg))) return;
@@ -1268,12 +1293,15 @@ export function createOrchestrator(
     flat: boolean,
     project: Project | undefined,
     perm: TurnPerm,
+    prepared?: { text: string; images?: string[]; receipt: ContextReceipt; signal?: AbortSignal },
     voicePrepared = false,
   ): Promise<void> {
+    if (prepared?.signal?.aborted) { prepared.receipt.rejected(); return; }
     // Reserve an ordered preparation lane before starting ASR. Later messages
     // in this session wait behind it; other topics and card actions stay free.
-    if (!voicePrepared && (messageHasVoice(msg) || voiceIntake.hasPending(sessionKey))) {
+    if (!prepared && !voicePrepared && (messageHasVoice(msg) || voiceIntake.hasPending(sessionKey))) {
       if (active.get(sessionKey)?.isGoal) { await replyGoalBusy(msg, flat); return; }
+      contextTargets.set(sessionKey, msg);
       voiceQueued.add(msg);
       voiceIntake.submit(sessionKey, async signal => {
         const body = messageHasVoice(msg) ? await voiceText(msg, signal) : text;
@@ -1281,19 +1309,46 @@ export function createOrchestrator(
         return { body, signal };
       }, async ({ body, signal }) => {
         if (signal.aborted) return;
-        await handleTurn(msg, body, sessionKey, flat, project, perm, true);
+        await handleTurn(msg, body, sessionKey, flat, project, perm, undefined, true);
       }, err => voiceFailed(msg, flat, err));
       return;
     }
-
-    // Capture title material before ingestContext adds sender/quote/file blocks.
-    const titleSource = sessionTitleSourceFromMessage(msg, text);
+    if (briefings && !prepared) {
+      const currentBriefings = briefings;
+      if (active.get(sessionKey)?.isGoal) { await replyGoalBusy(msg, flat); return; }
+      contextTargets.set(sessionKey, msg);
+      contextIntake.submit(sessionKey, async (signal) => {
+        const baseline = await getSession(sessionKey);
+        const currentProject = await getProjectByChatId(msg.chatId);
+        const [context, body, images] = await Promise.all([
+          currentBriefings.prepare(msg, sessionKey, signal, baseline, currentProject?.contextBriefing !== false), ingestContext(msg, text),
+          messageHasImages(msg) ? collectInboundImages(channel, msg) : Promise.resolve(undefined),
+        ]);
+        return { signal, text: weaveMemoryContext(body, context.block), images, receipt: context.receipt };
+      }, async (input) => {
+        const abort = () => input.receipt.rejected();
+        input.signal.addEventListener('abort', abort, { once: true });
+        try {
+          await handleTurn(msg, text, sessionKey, flat, project, perm, input);
+          await input.receipt.settled;
+        } finally {
+          input.signal.removeEventListener('abort', abort);
+          if (contextTargets.get(sessionKey) === msg) contextTargets.delete(sessionKey);
+        }
+      }, (err) => {
+        log.fail('intake', err, { phase: 'context-prepare' });
+        void channel.send(msg.chatId, { markdown: '❌ 消息准备失败，未提交给模型，请重发。' },
+          { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
+      });
+      return;
+    }
     // Mid-turn: steer (引导) or queue (排队).
     const existing = active.get(sessionKey);
     if (existing) {
       // 🎯 goal 会话不接外部输入（turns 由 codex 自续，queue 永远不被消费），
       // 入队只会在收尾被静默丢弃 —— 直接告知而不是黑洞。
       if (existing.isGoal) {
+        prepared?.receipt.rejected();
         await replyGoalBusy(msg, flat);
         return;
       }
@@ -1301,19 +1356,20 @@ export function createOrchestrator(
       // carry them. Awaited here — the session is already held by a running
       // turn, so there's no reservation race to protect; gated on
       // messageHasImages so the common text path stays await-free and fast.
-      const images = messageHasImages(msg) ? await collectInboundImages(channel, msg) : undefined;
+      const images = prepared ? prepared.images : (messageHasImages(msg) ? await collectInboundImages(channel, msg) : undefined);
       // Download file attachments too and weave their paths into the text (codex
       // reads them by path). Both awaits happen before re-reading the session.
-      const woven = await ingestContext(msg, text);
+      const woven = prepared?.text ?? await ingestContext(msg, text);
       // The turn may have finished while media downloaded — re-read the session.
       // If it's gone, start a fresh run (carrying what we already fetched).
       const cur = active.get(sessionKey);
       if (!cur) {
-        startReservedRun(msg, woven, sessionKey, flat, project, perm, images, true, text);
+        startReservedRun(msg, woven, sessionKey, flat, project, perm, images, true, text, undefined, prepared?.receipt);
         return;
       }
       // A goal may have started while media downloaded — same prompt as above.
       if (cur.isGoal) {
+        prepared?.receipt.rejected();
         await replyGoalBusy(msg, flat);
         return;
       }
@@ -1321,13 +1377,15 @@ export function createOrchestrator(
         const tid = cur.run.turnId();
         if (tid) {
           try {
-            await steerWithDeadline(cur.thread, { text: woven, images }, tid);
+            await steerWithDeadline(cur.thread, { text: woven, images }, tid, prepared?.signal);
+            prepared?.receipt.accepted(sessionKey, cur.thread.sessionId);
             log.info('intake', 'steer', { tid, images: images?.length ?? 0 });
             return;
           } catch (err) {
             log.warn('intake', 'steer-failed', { err: String(err) });
             if (!isRejectedSteer(err)) {
-              void channel.send(msg.chatId,
+              prepared?.receipt.rejected();
+              if (!prepared?.signal?.aborted) void channel.send(msg.chatId,
                 { markdown: '⚠️ 本条消息的接收确认失败，可能已进入模型。为避免重复执行，未自动重投；请先核对本轮结果。' },
                 { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
               return;
@@ -1338,16 +1396,17 @@ export function createOrchestrator(
       // steer() awaited an RPC: the previous run may have ended, or a new
       // run/goal may now own this key. Re-enter the synchronous reservation
       // path so the input is queued on the current owner or starts a new run.
-      // A pre-write rejection can race a dead consumer's terminal cleanup.
+      if (prepared?.signal?.aborted) { prepared.receipt.rejected(); return; }
       if (cur.thread && !cur.thread.isAlive() && active.get(sessionKey) === cur) {
         active.delete(sessionKey);
         if (sessions.get(sessionKey) === cur.thread) sessions.delete(sessionKey);
       }
-      startReservedRun(msg, woven, sessionKey, flat, project, perm, images, true, text);
+      startReservedRun(msg, woven, sessionKey, flat, project, perm, images, true, text, undefined, prepared?.receipt);
       return;
     }
 
-    startReservedRun(msg, text, sessionKey, flat, project, perm);
+    if (prepared) startReservedRun(msg, prepared.text, sessionKey, flat, project, perm, prepared.images, true, text, undefined, prepared.receipt);
+    else startReservedRun(msg, text, sessionKey, flat, project, perm);
   }
 
   /** 🎯 goal 运行中收到消息的统一提示（goal 会话不入队，见 ActiveState.isGoal）。 */
@@ -1383,6 +1442,7 @@ export function createOrchestrator(
     preIngested?: boolean,
     summaryText?: string,
     goal?: boolean,
+    contextReceipt?: ContextReceipt,
   ): void {
     // A goal title is the already-extracted objective. Ordinary turns retain
     // the SDK content type so merge-forward/media envelopes can be decoded
@@ -1403,6 +1463,7 @@ export function createOrchestrator(
       // A goal appeared in that window — its queue is never consumed, so prompt
       // instead of queueing (same as handleTurn's isGoal gate).
       if (existing.isGoal) {
+        contextReceipt?.rejected();
         void replyGoalBusy(msg, flat);
         return;
       }
@@ -1410,7 +1471,7 @@ export function createOrchestrator(
       // download) — queue onto it rather than launch a second turn. `text` is
       // already file-woven when preIngested (handleTurn's fall-through).
       existing.queue.push({
-        input: { text, images: preloadedImages },
+        input: { text, images: preloadedImages, contextReceipt },
         titleSource,
         requesterOpenId: msg.senderId,
         requestedAt: msg.createTime || Date.now(),
@@ -1461,7 +1522,7 @@ export function createOrchestrator(
         // 全量拉回来，汇合后用 filterHistorySince 收敛成与串行版逐字节一致的
         // 增量。唯一不投机的情况：有记录但无水位（resume 上来的旧会话，codex
         // 已带历史，串行版只在 recreated 罕见路径才拉）—— 留到汇合后补拉。
-        const topicId = goal ? undefined : msg.threadId;
+        const topicId = goal || briefings ? undefined : msg.threadId;
         const historyP: Promise<ContextMessage[]> = topicId
           ? priorP.then((p) =>
               p && p.lastSeenAt === undefined
@@ -1506,7 +1567,7 @@ export function createOrchestrator(
             // `summaryText` (handleTurn's original) so the session label isn't
             // manifest boilerplate + a temp path.
             summary: stripFileTokens(summaryText ?? text).slice(0, 80),
-            lastSeenAt: msg.createTime,
+            lastSeenAt: briefings ? undefined : msg.createTime,
             createdAt: Date.now(),
             updatedAt: Date.now(),
           });
@@ -1563,9 +1624,11 @@ export function createOrchestrator(
         }
         // Advance the high-water mark so the NEXT turn only catches up新消息.
         // (a brand-new session already wrote it in the upsert above.)
-        if (!neverSeen) void patchSession(sessionKey, { lastSeenAt: msg.createTime }).catch(() => undefined);
+        if (!neverSeen && !briefings) void patchSession(sessionKey, { lastSeenAt: msg.createTime }).catch(() => undefined);
         reserved.thread = thread;
+        contextReceipt?.signal?.throwIfAborted();
         const launchOpts: LaunchOpts = {
+          contextReceipt,
           chatId: msg.chatId,
           replyTo: msg.messageId,
           replyInThread: !flat,
@@ -1589,6 +1652,8 @@ export function createOrchestrator(
         else await launchRun(launchOpts, reaction);
       } catch (err) {
         if (active.get(sessionKey) === reserved) active.delete(sessionKey);
+        contextReceipt?.rejected();
+        for (const queued of reserved.queue) queued.input.contextReceipt?.rejected();
         const dropped = reserved.queue.splice(0).length;
         reaction?.done();
         log.fail('intake', err);
@@ -1670,6 +1735,7 @@ export function createOrchestrator(
     }
   }
 
+
   /**
    * Close every LIVE codex thread under `chatId` so a permission-tier change
    * actually rebinds. The codex sandbox is fixed at thread/start|resume and is
@@ -1734,7 +1800,15 @@ export function createOrchestrator(
       // Download any attached/forwarded images so the opening turn can see them,
       // and any file attachments (their paths get woven into the prompt text).
       const imagesP = messageHasImages(msg) ? collectInboundImages(channel, msg) : Promise.resolve(undefined);
-      const ingestP = ingestContext(msg, text);
+      let contextReceipt: ContextReceipt | undefined;
+      const ingestP = (async () => {
+        const body = await ingestContext(msg, text);
+        if (!briefings || goal) return body;
+        const currentProject = await getProjectByChatId(msg.chatId);
+        const context = await briefings.prepare(msg, `pending:${msg.messageId}`, new AbortController().signal, undefined, currentProject?.contextBriefing !== false);
+        contextReceipt = context.receipt;
+        return weaveMemoryContext(body, context.block);
+      })();
       let thread: AgentThread;
       let model: string;
       let effort: ReasoningEffort;
@@ -1746,6 +1820,7 @@ export function createOrchestrator(
         images = imgs;
         firstText = ingested || '你好，我们开始吧。';
       } catch (err) {
+        contextReceipt?.rejected();
         reaction?.done();
         // 失败路互不拖死：threadP 若已成功则回收孤儿进程，若失败吞掉其 rejection。
         void threadP.then((s) => s.thread.close()).catch(() => undefined);
@@ -1758,6 +1833,7 @@ export function createOrchestrator(
       log.info('card', 'start', { project: project?.name ?? '(unregistered)', model, effort, images: images?.length ?? 0, goal: Boolean(goal) });
       const titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource);
       const launchOpts: LaunchOpts = {
+        contextReceipt,
         chatId: msg.chatId,
         replyTo: msg.messageId,
         replyInThread: true,
@@ -1999,6 +2075,7 @@ export function createOrchestrator(
         if (active.get(sessionKey) === reserved) active.delete(sessionKey);
         // Messages that queued onto the reservation during compaction never ran —
         // say so instead of dropping them silently (same contract as a killed run).
+        for (const queued of reserved.queue) queued.input.contextReceipt?.rejected();
         if (reserved.queue.length > 0) {
           await reply(`⚠️ 压缩期间收到的 ${reserved.queue.length} 条消息未进入会话，请重发。`);
         }
@@ -2030,7 +2107,9 @@ export function createOrchestrator(
       void reply('⏳ 这一轮还在跑，结束后再 `/clear`。');
       return;
     }
+    cancelContext(sessionKey);
     const reserved: ActiveState = { queue: [], requesterOpenId: msg.senderId };
+    void briefings?.reset(sessionKey).catch(err => log.fail('intake', err, { phase: 'context-reset' }));
     active.set(sessionKey, reserved);
     void withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
       try {
@@ -2087,6 +2166,7 @@ export function createOrchestrator(
         if (active.get(sessionKey) === reserved) active.delete(sessionKey);
         // Messages that queued onto the reservation during the swap never ran —
         // say so instead of dropping them silently (same contract as runCompact).
+        for (const queued of reserved.queue) queued.input.contextReceipt?.rejected();
         if (reserved.queue.length > 0) {
           await reply(`⚠️ 清空期间收到的 ${reserved.queue.length} 条消息未进入会话，请重发。`);
         }
@@ -2240,6 +2320,7 @@ export function createOrchestrator(
         return buildModelCard(state);
       });
     })
+
     .on(RES.pick, ({ evt, value }) => {
       const state = authPending(resumePending, evt);
       const sessionId = typeof value.t === 'string' ? value.t : undefined;
@@ -2336,6 +2417,7 @@ export function createOrchestrator(
         denyRunControl(evt, key, RC.stop, '终止');
         return;
       }
+      cancelStateContext(st);
       st.interrupt?.();
       log.info('card', 'action', { actionId: 'run.stop', stopped: Boolean(st.interrupt) });
     })
@@ -3509,6 +3591,18 @@ export function createOrchestrator(
         return buildGroupSettingsCard({ name: '本群', kind: 'multi', noMention: on });
       });
     })
+
+
+
+    .on(GS.setContextBriefing, ({ evt, value }) => {
+      if (!isAdmin(cfg, evt.operator?.openId ?? '') || !['on', 'off'].includes(String(value.v))) return;
+      patch(evt, async () => {
+        const project = await getProjectByChatId(evt.chatId);
+        if (!project) return buildGroupSettingsCard({ name: '本群', kind: 'multi' });
+        const result = await performSetContextBriefing({ projectName: project.name, on: value.v === 'on' });
+        return buildGroupSettingsCard(result.ok ? result.project : project);
+      });
+    })
     .on(GS.setAutoCompact, ({ evt, value }) => {
       if (!isAdmin(cfg, evt.operator?.openId ?? '')) return;
       const on = value.v === 'on';
@@ -3691,6 +3785,18 @@ export function createOrchestrator(
         return buildProjectSettingsCard(r.project, backendDisplayName(r.project.backend));
       });
     })
+
+
+
+    .on(DM.setContextBriefingDm, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId) || !['on', 'off'].includes(String(value.v))) return;
+      const name = typeof value.n === 'string' ? value.n : '';
+      patch(evt, async () => {
+        const result = await performSetContextBriefing({ projectName: name, on: value.v === 'on' });
+        return result.ok ? buildProjectSettingsCard(result.project, backendDisplayName(result.project.backend))
+          : buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+      });
+    })
     .on(DM.setAutoCompactDm, ({ evt, value }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const name = typeof value.n === 'string' ? value.n : '';
@@ -3819,6 +3925,7 @@ export function createOrchestrator(
         // then evict out from under. Held until the rebind settles; released in
         // finally, with a notice for anything that queued and never ran.
         const reserved: ActiveState = { queue: [], requesterOpenId: state.requesterOpenId };
+        cancelContext(sessionKey);
         active.set(sessionKey, reserved);
         try {
           const history = await be.readHistory(state.cwd, sessionId);
@@ -3853,6 +3960,7 @@ export function createOrchestrator(
           settleUpdate(evt.messageId, buildResumeDoneCard(state));
         } finally {
           if (active.get(sessionKey) === reserved) active.delete(sessionKey);
+          for (const queued of reserved.queue) queued.input.contextReceipt?.rejected();
           if (reserved.queue.length > 0) {
             await channel
               .send(
@@ -3936,6 +4044,7 @@ export function createOrchestrator(
   }
 
   interface LaunchOpts {
+    contextReceipt?: ContextReceipt;
     chatId: string;
     replyTo: string;
     /** true on first reply that creates the topic; subsequent replies use replyTo only */
@@ -4076,7 +4185,7 @@ export function createOrchestrator(
 
     // M-3: 池满先排队（占位卡可见可取消）；null = 等待期被 ⏹ 取消，预订已释放。
     const slot = await acquireRunSlot(opts, state, activeKey, reaction);
-    if (!slot) return;
+    if (!slot) { opts.contextReceipt?.rejected(); for (const q of state.queue) q.input.contextReceipt?.rejected(); return; }
     const { release } = slot;
     let queuedCard = slot.queuedCard;
     reaction?.started(); // slot acquired → flip OneSecond → Typing
@@ -4173,9 +4282,10 @@ export function createOrchestrator(
     // intake durations ride the FIRST turn's stream.timing line only (M-1)
     let intake = opts.timing;
     let firstRec = opts.firstRec;
+    let currentReceipt = opts.contextReceipt;
     try {
       let currentTurn: QueuedTurn = {
-        input: { text: opts.firstText, images: opts.images },
+        input: { text: opts.firstText, images: opts.images, contextReceipt: opts.contextReceipt },
         titleSource: opts.titleSource,
         requesterOpenId: opts.requesterOpenId,
         requestedAt: opts.requestedAt ?? Date.now(),
@@ -4185,6 +4295,8 @@ export function createOrchestrator(
       let replyInThread = opts.flat ? false : (opts.replyInThread ?? Boolean(opts.knownThreadId));
       for (;;) {
         const turnInput = currentTurn.input;
+        currentReceipt = turnInput.contextReceipt;
+        if (currentReceipt?.signal?.aborted) { currentReceipt.rejected(); break; }
         state.requesterOpenId = currentTurn.requesterOpenId;
         if (titleTurnAttempted && !titleStart && opts.titleJobKey) {
           // A prior turn/start was rejected before turn_started. If a queued
@@ -4352,6 +4464,7 @@ export function createOrchestrator(
           if (!firstEvAt) firstEvAt = tEv;
           const et = (ev as { type?: string }).type;
           if (et === 'turn_started') {
+            currentReceipt?.accepted(topicThreadId, opts.thread.sessionId);
             // Host accepted the first turn. Title generation now overlaps the
             // remainder of that turn; the binding was persisted before this loop.
             beginSessionTitle();
@@ -4391,7 +4504,7 @@ export function createOrchestrator(
         const doneAt = Date.now(); // codex stopped emitting / loop ended
         stopper.dispose(); // 事件流已收尾：撤掉 ⏹ 的 5s 强停兜底定时器
         disposeInterrupt = undefined;
-        await stream.drain().catch(err => log.fail('card', err, { phase: 'terminal-drain' })); // terminal I/O must not kill a completed turn
+        await stream.drain().catch(err => log.fail('card', err, { phase: 'terminal-drain' })); // preserve completed turns on card failure
         state.interrupt = undefined; // turn done; nothing left to interrupt
         const interrupted = stopper.interrupted();
         // 杀进程恢复锤只留给「真出事」：watchdog 超时，或 ⏹ 后没等到干净收尾
@@ -4441,12 +4554,8 @@ export function createOrchestrator(
           await adoptThreadId(finalMsgId);
           rc.cardKey = finalMsgId;
 
-          // Outbound images + 卡片围栏 — only at terminal (uploads are slow; while
-          // streaming, ![](path) refs and ```feishu-card fences show as text). Scan
-          // the final answer once: upload every image ref (cached; covers both the
-          // run-card's inline images and any clean-card images), then post each
-          // ```feishu-card fence as a standalone clean card. Best-effort: a failed
-          // upload leaves the original markdown in place, a failed card is logged.
+          // Resolve final-answer images (successful streaming uploads hit the cache),
+          // retry failures once, and extract standalone clean-card fences.
           const answerText = finalMessageText(rc.rs);
           const { fences } = extractCardFences(answerText);
           const imgSources = imageSources(answerText);
@@ -4524,6 +4633,7 @@ export function createOrchestrator(
         // swallowing them. 优雅 ⏹ 虽然线程留用，但用户按了停就是要停：排队消息
         // 同样丢弃（语义与杀进程路径一致，只是进程不回收）。
         if (killed || procDead || interrupted) {
+          if (active.get(activeKey) === state) cancelContext(activeKey);
           if (state.queue.length > 0) {
             void channel
               .send(
@@ -4546,6 +4656,8 @@ export function createOrchestrator(
     } catch (err) {
       // Detach before any await: new messages must not join a failed consumer.
       if (active.get(activeKey) === state) active.delete(activeKey);
+      currentReceipt?.rejected();
+      for (const queued of state.queue) queued.input.contextReceipt?.rejected();
       const dropped = state.queue.splice(0).length;
       disposeInterrupt?.();
       state.run = undefined;
@@ -4559,6 +4671,8 @@ export function createOrchestrator(
         .send(opts.chatId, { markdown: runFailureMessage(err, dropped) }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
         .catch((sendError) => log.fail('intake', sendError, { phase: 'run-failure-feedback', dropped }));
     } finally {
+      currentReceipt?.rejected();
+      for (const queued of state.queue) queued.input.contextReceipt?.rejected();
       // A replacement run may have reserved the key while failure feedback
       // was in flight. Never delete another run's reservation.
       if (active.get(activeKey) === state) active.delete(activeKey);
@@ -5274,6 +5388,7 @@ export function createOrchestrator(
           log.info('intake', 'reaction-denied', { emoji: evt.emojiType, op: op.slice(-6) });
           return;
         }
+        cancelStateContext(running);
         running.interrupt?.();
         log.info('intake', 'reaction-stop', { emoji: evt.emojiType, stopped: Boolean(running.interrupt) });
         return;
@@ -5451,6 +5566,8 @@ export function createOrchestrator(
     clearInterval(reaper);
     voiceShutdown.abort();
     voiceIntake.close();
+    contextIntake.close();
+    await briefings?.close();
     await sessionTitles.shutdown();
     // adopt 失败的孤儿线程已在 launchRun/launchGoalRun 的 finally 就地 close，
     // 这里只需回收 LIVE 会话缓存。

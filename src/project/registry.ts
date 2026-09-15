@@ -50,6 +50,8 @@ export interface Project {
    * bridge pushes codex's auto-compact token limit past any real usage to disable
    * it (see backend sandboxParams / AUTO_COMPACT_OFF_LIMIT). */
   autoCompact?: boolean;
+  /** Conditional Luna briefing; off keeps raw new-message context. Default on. */
+  contextBriefing?: boolean;
   /** agent backend id for this project (see src/agent/index.ts registry).
    * Omitted on old/normal data → the codex default (DEFAULT_BACKEND_ID — historical path,
    * zero behavior change). Routed per project in createOrchestrator's
