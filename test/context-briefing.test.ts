@@ -189,3 +189,16 @@ it('passes the per-project model and Fast override to the briefing runner', asyn
   expect(factory).toHaveBeenCalledWith('gpt-5.6-sol', expect.any(AbortSignal), true);
   result.receipt.rejected();
 });
+
+
+it('closes a model whose factory resolves after the preparation deadline', async () => {
+  const t = setup([msg('old', '字'.repeat(2000))], { timeoutMs: 100 });
+  let finish!: (model: typeof t.model) => void;
+  t.factory.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+  const result = await t.c.prepare(input(), 'topic', signal());
+  expect(result.block).toContain('超时');
+  expect(t.model.close).not.toHaveBeenCalled();
+  finish(t.model);
+  await vi.waitFor(() => expect(t.model.close).toHaveBeenCalledTimes(1));
+  expect(t.model.ask).not.toHaveBeenCalled();
+});

@@ -158,12 +158,18 @@ export class ContextBriefing {
         else {
           this.runningModels++;
           try {
-            model = await bounded(this.modelFactory(policy?.model || this.config.model || 'gpt-5.6-luna', controller.signal, policy?.fast ?? false));
+            const readyModel = await bounded(this.modelFactory(policy?.model || this.config.model || 'gpt-5.6-luna', controller.signal, policy?.fast ?? false).then(async created => {
+              // The factory may ignore abort and resolve after bounded() returned.
+              if (controller.signal.aborted) { await created.close().catch(() => undefined); throw new Error('Late briefing model'); }
+              model = created;
+              return created;
+            }));
+            model = readyModel;
             let extra = 0;
             for (;;) {
               const input = { question: inboundHistory(msg), currentThreadId: msg.threadId, gaps,
                 remainingLookups: 3 - rounds, messages: messages.map(m => ({ ...m, text: m.text.slice(0, 4000) })) };
-              brief = parseBriefing(await bounded(model.ask(JSON.stringify(input), BRIEFING_SCHEMA, controller.signal)), messages);
+              brief = parseBriefing(await bounded(readyModel.ask(JSON.stringify(input), BRIEFING_SCHEMA, controller.signal)), messages);
               mode = 'luna';
               if (!brief.lookup || rounds >= 3 || extra >= 200) break;
               rounds++;

@@ -88,3 +88,5 @@ changes its probe window only, not production defaults.
 ### Project model and Fast
 
 Project settings expose `contextBriefing` (enabled), `contextBriefingModel` (default `gpt-5.6-luna`) and `contextBriefingFast` (default false). Group settings and the DM project card provide a model selector and Fast switch; Web accepts a model ID and has the same switches. Partial writes preserve all other options. These settings also control Discuss's continuous message summary independently of its reply judge. Disabling summary keeps raw history available.
+
+When `contextBriefing.enabled` is explicitly `false`, separately configured `memoryContext` injection remains enabled unless its own `inject` flag is false. Background memory sync has an independent `syncTimeoutMs` (default 60 seconds, range 100 ms–10 minutes). A timed-out child is killed and logged; the next interval retries after the child closes.

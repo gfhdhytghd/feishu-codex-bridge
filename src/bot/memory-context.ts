@@ -1,3 +1,4 @@
+import { log } from '../core/logger';
 import { spawn } from 'node:child_process';
 import type { AppConfig } from '../config/schema';
 import { getMemoryContextConfig } from '../config/schema';
@@ -14,7 +15,7 @@ export interface MemoryContextInput {
 }
 
 export async function loadMemoryContext(cfg: AppConfig, input: MemoryContextInput): Promise<string> {
-  if (cfg.preferences?.contextBriefing || cfg.preferences?.memoryContext?.inject === false) return '';
+  if ((cfg.preferences?.contextBriefing && cfg.preferences.contextBriefing.enabled !== false) || cfg.preferences?.memoryContext?.inject === false) return '';
   const config = getMemoryContextConfig(cfg);
   if (!config) return '';
 
@@ -75,12 +76,15 @@ export function startMemorySync(cfg: AppConfig): void {
       env: { ...process.env },
     });
     child.unref();
-    child.once('error', () => {
-      syncRunning = false;
-    });
-    child.once('close', () => {
-      syncRunning = false;
-    });
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      log.warn('intake', 'memory-sync-timeout', {});
+      // Wait for close before allowing another child; never overlap a survivor.
+    }, config.syncTimeoutMs);
+    timer.unref();
+    const finished = (): void => { clearTimeout(timer); syncRunning = false; };
+    child.once('error', finished);
+    child.once('close', finished);
   };
 
   const initial = setTimeout(run, 1_000);

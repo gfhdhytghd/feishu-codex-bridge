@@ -247,3 +247,12 @@ it('falls back to raw history without consuming an oversized summary version', a
   expect(saved.lanes.key.rawInjected.host).toBe(1);
   expect((await worker.context('key', 'another-host')).block).toContain('尾部约束必须保留');
 });
+
+
+it('skips an empty lane without starving later populated lanes', async () => {
+  const t = setup('IGNORE');
+  Object.assign(t.hooks, { enabled: async (_key: string, m: NormalizedMessage) => Boolean(m.chatId) });
+  await t.worker.context('empty', 'host');
+  await t.worker.observe('key', msg('still-judged'), false);
+  await wait(async () => expect((await state()).lanes.key.entries[0].state).toBe('ignored'));
+});

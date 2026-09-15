@@ -102,6 +102,7 @@ export interface MemoryContextConfig {
   /** Optional background sync arguments, run by the already-authorized bridge process. */
   syncArgs?: string[];
   syncIntervalSeconds?: number;
+  syncTimeoutMs?: number;
 }
 
 export interface ResolvedMemoryContextConfig {
@@ -111,11 +112,12 @@ export interface ResolvedMemoryContextConfig {
   maxOutputBytes: number;
   syncArgs: string[];
   syncIntervalMs: number;
+  syncTimeoutMs: number;
 }
 
 export interface AppPreferences {
-  /** Question-conditioned, current-chat context. Configured even when disabled
-   * to retain scoped raw-history fallback instead of legacy global memory. */
+  /** Question-conditioned, current-chat context. When explicitly disabled,
+   * separately configured memory injection remains available. */
   contextBriefing?: {
     enabled?: boolean;
     model?: string;
@@ -257,6 +259,8 @@ export function getMemoryContextConfig(cfg: AppConfig): ResolvedMemoryContextCon
     syncArgs: Array.isArray(raw.syncArgs)
       ? raw.syncArgs.filter((value): value is string => typeof value === 'string')
       : [],
+    syncTimeoutMs: typeof raw.syncTimeoutMs === 'number' && Number.isFinite(raw.syncTimeoutMs)
+      ? Math.min(600_000, Math.max(100, Math.floor(raw.syncTimeoutMs))) : 60_000,
     syncIntervalMs:
       typeof raw.syncIntervalSeconds === 'number' && Number.isFinite(raw.syncIntervalSeconds)
         ? Math.min(86_400, Math.max(60, Math.floor(raw.syncIntervalSeconds))) * 1_000
