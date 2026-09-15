@@ -188,7 +188,7 @@ function renderRunning(state: RunState, rc: RunCardState): CardElement[] {
   // growth streams via cardElement.content. Stable element_id ⇒ append-only prefix.
   const answer = textParts.join('\n\n');
   if (answer) {
-    if (rc.images?.size) elements.push(...renderRichText(answer, rc.images));
+    if (rc.images?.size) elements.push(...renderRichText(answer, rc.images, ANSWER_EID));
     else elements.push(mdStream(answer, ANSWER_EID));
   }
 
@@ -262,7 +262,7 @@ function renderTerminal(state: RunState, rc: RunCardState): CardElement[] {
   const processBlocks = state.blocks.filter((_, i) => i !== answerIdx);
   const blocks = rc.showTools === false ? processBlocks.filter((b) => b.kind !== 'tool') : processBlocks;
   const reasoning = reasoningContent(state);
-  const processEls = buildProcessBody(reasoning, blocks);
+  const processEls = buildProcessBody(reasoning, blocks, rc.images);
   if (processEls.length > 0) {
     const toolCount = blocks.reduce((n, b) => (b.kind === 'tool' ? n + 1 : n), 0);
     elements.push(
@@ -338,20 +338,20 @@ function lastTextIndex(blocks: Block[]): number {
  * (with tool-output bodies) exceeds {@link PROCESS_BODY_BUDGET}, rebuild it with
  * every tool group degraded to a header-only summary.
  */
-function buildProcessBody(reasoning: string, blocks: Block[]): CardElement[] {
-  const rich = processElements(reasoning, blocks, false);
+function buildProcessBody(reasoning: string, blocks: Block[], images?: ReadonlyMap<string, string>): CardElement[] {
+  const rich = processElements(reasoning, blocks, false, images);
   if (estimateSize(rich) <= PROCESS_BODY_BUDGET && estimateComponents(rich) <= PROCESS_COMPONENT_BUDGET) {
     return rich;
   }
-  return processElements(reasoning, blocks, true);
+  return processElements(reasoning, blocks, true, images);
 }
 
-function processElements(reasoning: string, blocks: Block[], compactTools: boolean): CardElement[] {
+function processElements(reasoning: string, blocks: Block[], compactTools: boolean, images?: ReadonlyMap<string, string>): CardElement[] {
   const out: CardElement[] = [];
   if (reasoning) out.push(reasoningPanel(reasoning, false));
   for (const group of groupBlocks(blocks)) {
     if (group.kind === 'text') {
-      if (group.content.trim()) out.push(md(group.content));
+      if (group.content.trim()) out.push(...renderRichText(group.content, images));
     } else {
       out.push(...renderToolGroup(group.tools, true, compactTools));
     }

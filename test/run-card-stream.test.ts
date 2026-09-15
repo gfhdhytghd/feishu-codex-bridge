@@ -288,6 +288,7 @@ describe('live markdown images', () => {
 
 
 describe('resolved CardKit business errors', () => {
+  afterEach(() => vi.useRealTimers());
   it('retries a rejected terminal frame and ignores late coalesced repaints', async () => {
     vi.useFakeTimers();
     const ch = fakeChannel();
@@ -320,5 +321,56 @@ describe('resolved CardKit business errors', () => {
     await vi.runAllTimersAsync();
     expect(await done).toBe(false);
     expect(update).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('image delivery regressions', () => {
+  it('returns to element streaming for text appended after an uploaded image', async () => {
+    const ch = fakeChannel();
+    const s = new RunCardStream();
+    const rc = { rs: { ...initialState, blocks: [
+      { kind: 'text' as const, id: 'a', streaming: true, content: 'before ![plot](plot.png) after' },
+    ] }, cardKey: 'image-tail', images: new Map([['plot.png', 'img_plot']]) };
+    await s.create(ch, 'image-tail-test', buildRunCard(rc), {});
+    s.streamCoalesced(ch, buildRunCard(rc), ANSWER_EID);
+    await s.drain();
+    const updates = ch.updates.length;
+    rc.rs.blocks[0]!.content += ' more';
+    s.streamCoalesced(ch, buildRunCard(rc), ANSWER_EID);
+    await s.drain();
+    expect(ch.contents.at(-1).content).toBe('after more');
+    expect(ch.updates).toHaveLength(updates);
+    rc.rs.blocks[0]!.content += ' text';
+    s.streamCoalesced(ch, buildRunCard(rc), ANSWER_EID);
+    await s.drain();
+    expect(ch.contents.at(-1).content).toBe('after more text');
+    expect(ch.updates).toHaveLength(updates);
+  });
+
+  it('retains progress images and reserves a separate bounded final-answer pass', async () => {
+    const upload = vi.fn(async (sources: string[]) => new Map(sources.map(src => [src, `key:${src}`])));
+    const worker = new StreamingImages(upload, () => undefined);
+    worker.refresh(Array.from({ length: 9 }, (_, i) => `![progress](progress${i}.png)`).join(' '));
+    await worker.drain();
+    worker.refresh('![final](final.png)');
+    await worker.drain();
+    expect(upload).toHaveBeenCalledTimes(1); // streaming budget exhausted
+    const images = await worker.finalize('![final](final.png)');
+    expect(images.get('progress0.png')).toBe('key:progress0.png');
+    expect(images.get('final.png')).toBe('key:final.png');
+    expect(upload.mock.calls[1]![0]).toEqual(['final.png']);
+    const lastPass = Array.from({ length: 12 }, (_, i) => `![final](f${i}.png)`).join(' ');
+    await worker.finalize(lastPass);
+    expect(upload.mock.calls[2]![0]).toHaveLength(9);
+  });
+
+  it('keeps an already displayed key when the final retry cannot read the file', async () => {
+    const upload = vi.fn(async (_sources: string[]) => new Map([['plot.png', 'already_uploaded']]));
+    const worker = new StreamingImages(upload, () => undefined);
+    worker.refresh('![plot](plot.png)');
+    await worker.drain();
+    upload.mockResolvedValueOnce(new Map());
+    const images = await worker.finalize('![plot](plot.png)');
+    expect(images.get('plot.png')).toBe('already_uploaded');
   });
 });

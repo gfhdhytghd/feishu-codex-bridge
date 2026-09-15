@@ -448,3 +448,21 @@ describe('tool default collapse preference', () => {
     expect(JSON.stringify(buildRunCard({ rs: live(), collapseTools: true, showTools: false }))).not.toContain('command-3');
   });
 });
+
+describe('terminal progress images', () => {
+  it('keeps uploaded progress images inside the process panel beside final-answer images', () => {
+    const s = run([
+      { type: 'text_delta', itemId: 'progress', delta: 'Preview ![draft](draft.png)' },
+      { type: 'text_delta', itemId: 'answer', delta: 'Final ![result](result.png)' },
+      { type: 'done', turnId: 'turn' },
+    ]);
+    const card = buildRunCard({ rs: s, cardKey: 'test', images: new Map([
+      ['draft.png', 'img_draft'], ['result.png', 'img_result'],
+    ]) });
+    const els = bodyEls(card);
+    const process = els.find(el => el.tag === 'collapsible_panel');
+    expect(JSON.stringify(process)).toContain('img_draft');
+    expect(JSON.stringify(process)).not.toContain('![draft]');
+    expect(els.some(el => el.tag === 'img' && el.img_key === 'img_result')).toBe(true);
+  });
+});
