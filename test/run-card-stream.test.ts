@@ -285,3 +285,40 @@ describe('live markdown images', () => {
     expect(repaint).not.toHaveBeenCalled();
   });
 });
+
+
+describe('resolved CardKit business errors', () => {
+  it('retries a rejected terminal frame and ignores late coalesced repaints', async () => {
+    vi.useFakeTimers();
+    const ch = fakeChannel();
+    const update = ch.rawClient.cardkit.v1.card.update;
+    let attempts = 0;
+    ch.rawClient.cardkit.v1.card.update = async (p: any) => {
+      if (++attempts === 1) return { code: 300317, msg: 'out of order' };
+      return update(p);
+    };
+    const s = new RunCardStream();
+    await s.create(ch, 'resolved-retry', frame('running'), {});
+    const done = s.finalizeCard(ch, card([mdStream('done', 'answer')], { streaming: false }));
+    s.streamCoalesced(ch, frame('late running'), 'answer');
+    await vi.runAllTimersAsync();
+    expect(await done).toBe(true);
+    expect(attempts).toBe(2);
+    expect(ch.updates).toHaveLength(1);
+    expect(JSON.parse(ch.updates[0].data).config.streaming_mode).toBe(false);
+    expect(ch.updates[0].data).not.toContain('late running');
+  });
+
+  it('reports failure when every terminal response is a business rejection', async () => {
+    vi.useFakeTimers();
+    const ch = fakeChannel();
+    const update = vi.fn(async () => ({ code: 200810, msg: 'rejected' }));
+    ch.rawClient.cardkit.v1.card.update = update;
+    const s = new RunCardStream();
+    await s.create(ch, 'resolved-failure', frame('running'), {});
+    const done = s.finalizeCard(ch, frame('done'));
+    await vi.runAllTimersAsync();
+    expect(await done).toBe(false);
+    expect(update).toHaveBeenCalledTimes(2);
+  });
+});

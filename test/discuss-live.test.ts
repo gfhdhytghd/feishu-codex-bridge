@@ -52,3 +52,27 @@ it.skipIf(process.env.DISCUSS_LIVE !== '1')('persistent Luna updates its summary
     expect(rows.some(row => row.messageIds.includes('correction') && row.text.includes('周一'))).toBe(true);
   } finally { await luna.close(); await rm(storageRoot, { recursive: true, force: true }); }
 }, 60000);
+
+
+it.skipIf(process.env.DISCUSS_CONFIRMATION_LIVE !== '1').each([
+  { runId: null, answer: 'FOLLOW_UP' },
+  { runId: 'running-turn', answer: 'STEER' },
+])('routes a pending confirmation with runId=$runId', async ({ runId, answer }) => {
+  const { JUDGE_PROMPT, JUDGE_SCHEMA } = await import('../src/bot/discuss');
+  const signal = AbortSignal.timeout(110000);
+  const judge = await createDiscussModel({ model: 'gpt-6-astra', effort: 'low', instructions: JUDGE_PROMPT }, signal);
+  try {
+    const result = JSON.parse(await judge.ask(JSON.stringify({
+      hostId: 'confirmation-test', runId, busy: runId !== null,
+      recent: [{ role: 'assistant', content: '已在过程消息中用 Markdown 引用图片，等待你确认是否可见。' }],
+      messages: [{ messageId: 'confirmation', content: '很好没问题' }],
+    }), JUDGE_SCHEMA, signal));
+    expect(result.decisions).toEqual([expect.objectContaining({ messageId: 'confirmation', action: answer })]);
+    const courtesy = JSON.parse(await judge.ask(JSON.stringify({
+      hostId: 'courtesy-test', runId: null, busy: false,
+      recent: [{ role: 'assistant', content: '任务已完成，验收已通过，没有待确认事项。' }],
+      messages: [{ messageId: 'thanks', content: '谢谢' }],
+    }), JUDGE_SCHEMA, signal));
+    expect(courtesy.decisions).toEqual([expect.objectContaining({ messageId: 'thanks', action: 'IGNORE' })]);
+  } finally { await judge.close(); }
+}, 120000);

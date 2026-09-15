@@ -239,7 +239,7 @@ describe('buildRunCard — terminal collapse', () => {
 
   it('turns off streaming on a terminal card', () => {
     const card = buildRunCard({ rs: fullRun() }) as { config: { streaming_mode?: boolean } };
-    expect(card.config.streaming_mode).toBeUndefined();
+    expect(card.config.streaming_mode).toBe(false);
   });
 
   it('keeps a partial answer above the note when interrupted', () => {
