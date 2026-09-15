@@ -29,10 +29,10 @@ process.stdin.on('data', (d) => {
         send({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'bad params' } });
         continue;
       }
-      send({ jsonrpc: '2.0', id: msg.id, result: {} });
-      send({ jsonrpc: '2.0', method: 'turn/started', params: { turn: { id: 't1' } } });
-      send({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: { itemId: 'i1', delta: 'hi' } });
-      send({ jsonrpc: '2.0', method: 'turn/completed', params: { turn: { id: 't1' } } });
+      send({ jsonrpc: '2.0', id: msg.id, result: { turn: { id: 't1' } } });
+      send({ jsonrpc: '2.0', method: 'turn/started', params: { threadId: 'th_eager', turn: { id: 't1' } } });
+      send({ jsonrpc: '2.0', method: 'item/agentMessage/delta', params: { threadId: 'th_eager', turnId: 't1', itemId: 'i1', delta: 'hi' } });
+      send({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: 'th_eager', turn: { id: 't1' } } });
       continue;
     }
     const result = msg.method === 'thread/start' ? { thread: { id: 'th_eager' } } : {};

@@ -503,6 +503,7 @@ export class ClaudeAgentThread implements AgentThread {
       /* ignore */
     }
   }
+  readonly supportsSteer = false;
   async steer(): Promise<void> {
     // capabilities.steer=false → orchestrator queues the steer as the next turn.
     throw new Error('claude-agent 后端暂不支持飞行中引导（steer），将自动改为下一轮发送');

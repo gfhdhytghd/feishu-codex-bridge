@@ -1,5 +1,6 @@
 import { messageHasVoice, transcribeVoice, VoiceError } from './voice';
 import { VoiceIntake } from './voice-intake';
+import { steerWithDeadline, isRejectedSteer } from './steer-delivery';
 import type {
   BotAddedEvent,
   CardActionEvent,
@@ -452,6 +453,13 @@ export function settleOrdinaryTurnRender(
     // finalize() is a no-op for explicit done/error terminals.
     render.finalize();
   }
+}
+
+/** Failure feedback includes unprocessed follow-ups; they must never disappear
+ * behind an error referring only to the original message. */
+function runFailureMessage(err: unknown, dropped: number): string {
+  const error = `❌ ${err instanceof Error ? err.message : String(err)}`;
+  return dropped > 0 ? `${error}\n\n⚠️ ${dropped} 条排队消息未执行，请重发。` : error;
 }
 
 interface ActiveState {
@@ -1309,26 +1317,33 @@ export function createOrchestrator(
         await replyGoalBusy(msg, flat);
         return;
       }
-      if (cur.queue.length === 0 && !voiceQueued.has(msg) && !messageHasVoice(msg) && getPendingPolicy(cfg) === 'steer' && cur.run && cur.thread) {
+      if (cur.queue.length === 0 && !voiceQueued.has(msg) && !messageHasVoice(msg) && getPendingPolicy(cfg) === 'steer' && cur.run && cur.thread && cur.thread.supportsSteer !== false) {
         const tid = cur.run.turnId();
         if (tid) {
           try {
-            await cur.thread.steer({ text: woven, images }, tid);
+            await steerWithDeadline(cur.thread, { text: woven, images }, tid);
             log.info('intake', 'steer', { tid, images: images?.length ?? 0 });
             return;
           } catch (err) {
             log.warn('intake', 'steer-failed', { err: String(err) });
+            if (!isRejectedSteer(err)) {
+              void channel.send(msg.chatId,
+                { markdown: '⚠️ 本条消息的接收确认失败，可能已进入模型。为避免重复执行，未自动重投；请先核对本轮结果。' },
+                { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
+              return;
+            }
           }
         }
       }
-      cur.queue.push({
-        input: { text: woven, images },
-        titleSource,
-        requesterOpenId: msg.senderId,
-        requestedAt: msg.createTime || Date.now(),
-        summary: stripFileTokens(text).slice(0, 80) || undefined,
-      });
-      log.info('intake', 'queued', { depth: cur.queue.length });
+      // steer() awaited an RPC: the previous run may have ended, or a new
+      // run/goal may now own this key. Re-enter the synchronous reservation
+      // path so the input is queued on the current owner or starts a new run.
+      // A pre-write rejection can race a dead consumer's terminal cleanup.
+      if (cur.thread && !cur.thread.isAlive() && active.get(sessionKey) === cur) {
+        active.delete(sessionKey);
+        if (sessions.get(sessionKey) === cur.thread) sessions.delete(sessionKey);
+      }
+      startReservedRun(msg, woven, sessionKey, flat, project, perm, images, true, text);
       return;
     }
 
@@ -1573,11 +1588,12 @@ export function createOrchestrator(
         if (goal) await launchGoalRun(launchOpts);
         else await launchRun(launchOpts, reaction);
       } catch (err) {
-        active.delete(sessionKey); // release the reservation so the session isn't wedged
+        if (active.get(sessionKey) === reserved) active.delete(sessionKey);
+        const dropped = reserved.queue.splice(0).length;
         reaction?.done();
         log.fail('intake', err);
         await channel
-          .send(msg.chatId, { markdown: `❌ ${err instanceof Error ? err.message : String(err)}` }, { replyTo: msg.messageId, replyInThread: !flat })
+          .send(msg.chatId, { markdown: runFailureMessage(err, dropped) }, { replyTo: msg.messageId, replyInThread: !flat })
           .catch(() => undefined);
       }
     });
@@ -4153,6 +4169,7 @@ export function createOrchestrator(
     // tracks the latest run card key so the finally can clear runsByCard even
     // if the stream producer throws mid-turn (avoids leaking a stale stop target)
     let curCardKey: string | undefined;
+    let disposeInterrupt: (() => void) | undefined;
     // intake durations ride the FIRST turn's stream.timing line only (M-1)
     let intake = opts.timing;
     let firstRec = opts.firstRec;
@@ -4310,6 +4327,7 @@ export function createOrchestrator(
           abort: (tid) => void opts.thread.abort(tid).catch(() => undefined),
           forceStop: resolveStop,
         });
+        disposeInterrupt = stopper.dispose;
         state.interrupt = stopper.interrupt;
         const idleMs = currentIdleMs();
         const guarded = withIdleTimeout(
@@ -4369,9 +4387,11 @@ export function createOrchestrator(
           // typewriter (cardElement.content), structure → whole-card update.
           stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID);
         }
+        state.run = undefined; // completion-card I/O must queue, never steer into a finished turn
         const doneAt = Date.now(); // codex stopped emitting / loop ended
         stopper.dispose(); // 事件流已收尾：撤掉 ⏹ 的 5s 强停兜底定时器
-        await stream.drain(); // flush the last coalesced frame before terminal
+        disposeInterrupt = undefined;
+        await stream.drain().catch(err => log.fail('card', err, { phase: 'terminal-drain' })); // terminal I/O must not kill a completed turn
         state.interrupt = undefined; // turn done; nothing left to interrupt
         const interrupted = stopper.interrupted();
         // 杀进程恢复锤只留给「真出事」：watchdog 超时，或 ⏹ 后没等到干净收尾
@@ -4417,74 +4437,83 @@ export function createOrchestrator(
         }
 
         const finalMsgId = cardMsgId;
-        await adoptThreadId(finalMsgId);
-        rc.cardKey = finalMsgId;
+        try {
+          await adoptThreadId(finalMsgId);
+          rc.cardKey = finalMsgId;
 
-        // Resolve final-answer images (successful streaming uploads hit the cache),
-        // retry failures once, and extract standalone clean-card fences.
-        const answerText = finalMessageText(rc.rs);
-        const { fences } = extractCardFences(answerText);
-        const imgSources = imageSources(answerText);
-        if (imgSources.length > 0) {
-          rc.images = await uploadRunImages(opts, imgSources, state.requesterOpenId);
-        }
-
-        // terminal whole-card update: final render with streaming off (clears the
-        // typewriter cursor) and no ⏹ button. Remove the callback before freezing
-        // live repaints; already-accepted repaint writes are serialized ahead of
-        // finalizeCard, while callbacks arriving from now on cannot overwrite it.
-        const manuallyRequested = Boolean(state.completionReminderRequested);
-        completionReminderRefreshers.delete(cardMsgId);
-        const terminalCardUpdated = await stream.finalizeCard(channel, buildRunCard(rc));
-        // One-line per-turn timeline; all ms are relative to the turn's stream start.
-        {
-          const terminalAt = Date.now();
-          const st = stream.stats();
-          log.info('stream', 'timing', {
-            tResolve: intake?.tResolve ?? -1, // 入站段耗时（仅首轮有值；M-1 并行化观测）
-            tWeave: intake?.tWeave ?? -1,
-            tCardCreate,
-            tTurnStart: turnStartAt - tStart, // 负数 = turn/start 抢在流循环前多少 ms（QW-1 并行收益）
-            firstEv: firstEvAt ? firstEvAt - tStart : -1,
-            firstText: firstTextAt ? firstTextAt - tStart : -1,
-            lastEv: lastEvAt - tStart,
-            done: doneAt - tStart,
-            terminal: terminalAt - tStart,
-            doneToTerminal: terminalAt - doneAt,
-            events: evCount,
-            textChars,
-            pushes: st.pushCount,
-            cardPushes: st.cardPushes,
-            elPushes: st.elPushes,
-            rttAvg: st.pushCount ? Math.round(st.totalRttMs / st.pushCount) : 0,
-            rttMax: st.maxRttMs,
-          });
-          intake = undefined; // 排队续轮没有入站段，别把首轮数值带下去
-        }
-        runsByCard.delete(cardMsgId);
-        promoteCard(finalMsgId, rc);
-
-        for (const fence of fences) {
-          try {
-            await sendManagedCard(channel, opts.chatId, buildCleanCard(fence, rc.images), finalMsgId, !opts.flat);
-          } catch (err) {
-            log.fail('card', err, { phase: 'clean-card' });
+          // Outbound images + 卡片围栏 — only at terminal (uploads are slow; while
+          // streaming, ![](path) refs and ```feishu-card fences show as text). Scan
+          // the final answer once: upload every image ref (cached; covers both the
+          // run-card's inline images and any clean-card images), then post each
+          // ```feishu-card fence as a standalone clean card. Best-effort: a failed
+          // upload leaves the original markdown in place, a failed card is logged.
+          const answerText = finalMessageText(rc.rs);
+          const { fences } = extractCardFences(answerText);
+          const imgSources = imageSources(answerText);
+          if (imgSources.length > 0) {
+            rc.images = await uploadRunImages(opts, imgSources, state.requesterOpenId);
           }
+
+          // terminal whole-card update: final render with streaming off (clears the
+          // typewriter cursor) and no ⏹ button. Remove the callback before freezing
+          // live repaints; already-accepted repaint writes are serialized ahead of
+          // finalizeCard, while callbacks arriving from now on cannot overwrite it.
+          const manuallyRequested = Boolean(state.completionReminderRequested);
+          completionReminderRefreshers.delete(cardMsgId);
+          const terminalCardUpdated = await stream.finalizeCard(channel, buildRunCard(rc));
+          // One-line per-turn timeline; all ms are relative to the turn's stream start.
+          {
+            const terminalAt = Date.now();
+            const st = stream.stats();
+            log.info('stream', 'timing', {
+              tResolve: intake?.tResolve ?? -1, // 入站段耗时（仅首轮有值；M-1 并行化观测）
+              tWeave: intake?.tWeave ?? -1,
+              tCardCreate,
+              tTurnStart: turnStartAt - tStart, // 负数 = turn/start 抢在流循环前多少 ms（QW-1 并行收益）
+              firstEv: firstEvAt ? firstEvAt - tStart : -1,
+              firstText: firstTextAt ? firstTextAt - tStart : -1,
+              lastEv: lastEvAt - tStart,
+              done: doneAt - tStart,
+              terminal: terminalAt - tStart,
+              doneToTerminal: terminalAt - doneAt,
+              events: evCount,
+              textChars,
+              pushes: st.pushCount,
+              cardPushes: st.cardPushes,
+              elPushes: st.elPushes,
+              rttAvg: st.pushCount ? Math.round(st.totalRttMs / st.pushCount) : 0,
+              rttMax: st.maxRttMs,
+            });
+            intake = undefined; // 排队续轮没有入站段，别把首轮数值带下去
+          }
+          runsByCard.delete(cardMsgId);
+          promoteCard(finalMsgId, rc);
+
+          for (const fence of fences) {
+            try {
+              await sendManagedCard(channel, opts.chatId, buildCleanCard(fence, rc.images), finalMsgId, !opts.flat);
+            } catch (err) {
+              log.fail('card', err, { phase: 'clean-card' });
+            }
+          }
+          if (topicThreadId) {
+            touchSession(topicThreadId); // 轮次收尾打点（M-3 reaper 的空闲时钟）
+            await patchSession(topicThreadId, { updatedAt: Date.now() });
+          }
+          await sendCompletionReminder({
+            cardMsgId: finalMsgId,
+            requesterOpenId: currentTurn.requesterOpenId,
+            outcome: rc.rs.terminal === 'running' ? 'done' : rc.rs.terminal,
+            requestedAt: currentTurn.requestedAt,
+            manuallyRequested,
+            summary: currentTurn.summary,
+            cardUpdated: terminalCardUpdated,
+            replyInThread: !opts.flat,
+          });
+        } catch (err) {
+          log.fail('card', err, { phase: 'terminal-delivery' });
+          void channel.send(opts.chatId, { markdown: '⚠️ 本轮已结束，但结果同步失败，请检查会话记录。' }, { replyTo: finalMsgId, replyInThread: !opts.flat }).catch(() => undefined);
         }
-        if (topicThreadId) {
-          touchSession(topicThreadId); // 轮次收尾打点（M-3 reaper 的空闲时钟）
-          await patchSession(topicThreadId, { updatedAt: Date.now() });
-        }
-        await sendCompletionReminder({
-          cardMsgId: finalMsgId,
-          requesterOpenId: currentTurn.requesterOpenId,
-          outcome: rc.rs.terminal === 'running' ? 'done' : rc.rs.terminal,
-          requestedAt: currentTurn.requestedAt,
-          manuallyRequested,
-          summary: currentTurn.summary,
-          cardUpdated: terminalCardUpdated,
-          replyInThread: !opts.flat,
-        });
         retrySessionTitleAfterTurn();
         replyTo = finalMsgId;
         replyInThread = !opts.flat; // stay in the topic for queued turns (single: stay flat)
@@ -4515,12 +4544,24 @@ export function createOrchestrator(
         activateQueuedTurn(state, currentTurn);
       }
     } catch (err) {
+      // Detach before any await: new messages must not join a failed consumer.
+      if (active.get(activeKey) === state) active.delete(activeKey);
+      const dropped = state.queue.splice(0).length;
+      disposeInterrupt?.();
+      state.run = undefined;
+      state.interrupt = undefined;
+      // A stream/card failure can leave an agent turn running. Retire that
+      // client before the next message resumes the persisted session.
+      if (topicThreadId && sessions.get(topicThreadId) === opts.thread) sessions.delete(topicThreadId);
+      await opts.thread.close().catch(() => undefined);
       log.fail('intake', err);
       await channel
-        .send(opts.chatId, { markdown: `❌ ${err instanceof Error ? err.message : String(err)}` }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
-        .catch(() => undefined);
+        .send(opts.chatId, { markdown: runFailureMessage(err, dropped) }, { replyTo: opts.replyTo, replyInThread: !opts.flat })
+        .catch((sendError) => log.fail('intake', sendError, { phase: 'run-failure-feedback', dropped }));
     } finally {
-      active.delete(activeKey);
+      // A replacement run may have reserved the key while failure feedback
+      // was in flight. Never delete another run's reservation.
+      if (active.get(activeKey) === state) active.delete(activeKey);
       if (curCardKey) {
         runsByCard.delete(curCardKey);
         completionReminderRefreshers.delete(curCardKey);
