@@ -1,5 +1,5 @@
 import { JsonRpcError } from '../src/agent/codex-appserver/app-server-client';
-import { rm } from 'node:fs/promises';
+import { rm, readFile } from 'node:fs/promises';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import type { AgentEvent, AgentInput } from '../src/agent/types';
@@ -260,4 +260,35 @@ it('does not judge a voice preparation invalidated by permission eviction', asyn
   await fake.evict!('chat'); asr.resolve('不得执行');
   await new Promise(r => setTimeout(r, 1100));
   expect(fake.judgeCalls).toBe(0);
+});
+
+async function durableEntries() {
+  const state = JSON.parse(await readFile(`/tmp/feishu-discuss-intake-test-${process.pid}.json.discuss.json`, 'utf8'));
+  return Object.values(state.lanes).flatMap((lane: any) => lane.entries) as {msg: {messageId: string}; state: string}[];
+}
+it('rejects oversized automatic delivery without accepting messages or notifying repeatedly', async () => {
+  const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
+  const o = setup(); const msg = {...message('汉'.repeat(90000)), mentionedBot: false};
+  await o.onMessage(msg);
+  await vi.waitFor(() => expect(fake.log.warn).toHaveBeenCalledWith('intake', 'discuss-delivery-over-budget', expect.anything()), {timeout:3500});
+  await vi.waitFor(async () => expect((await durableEntries()).find(e=>e.msg.messageId===msg.messageId)?.state).toBe('followup'));
+  expect(run.consumed).toHaveLength(0); expect(run.t.steer).not.toHaveBeenCalled();
+  expect(fake.send).not.toHaveBeenCalled();
+});
+it('rejects oversized mention takeover, releases every message and leaves the preparation lane usable', async () => {
+  const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
+  const o = setup();
+  const prior = {...message('汉'.repeat(50000)), mentionedBot:false};
+  const direct = message('字'.repeat(50000));
+  await o.onMessage(prior); await o.onMessage(direct);
+  await vi.waitFor(() => expect(fake.send).toHaveBeenCalledWith('chat', {markdown: expect.stringContaining('分批')}, {replyTo:direct.messageId, replyInThread:false}));
+  await vi.waitFor(async () => {
+    const entries = await durableEntries();
+    for (const msg of [prior,direct]) expect(entries.find(e=>e.msg.messageId===msg.messageId)?.state).toBe('pending');
+  });
+  expect(run.consumed).toHaveLength(0);
+  // Another explicit request completes preparation instead of hanging on an unsettled receipt.
+  const again = message('再试'); await o.onMessage(again);
+  await vi.waitFor(()=>expect(fake.send.mock.calls.filter(call=>JSON.stringify(call).includes('分批'))).toHaveLength(2));
+  expect(run.consumed).toHaveLength(0);
 });

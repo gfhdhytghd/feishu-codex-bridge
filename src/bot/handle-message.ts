@@ -1,3 +1,4 @@
+import { assertDiscussDeliveryBudget, DiscussDeliveryBudgetError } from './discuss-delivery-budget';
 import { messageHasVoice, transcribeVoice, VoiceError } from './voice';
 import { VoiceIntake } from './voice-intake';
 import { steerWithDeadline, isRejectedSteer } from './steer-delivery';
@@ -761,6 +762,11 @@ export function createOrchestrator(
       if (!current.enabled || current.signature !== snapshot.signature || current.goal) return false;
       if (context.receipt.signal?.aborted) return false;
       const text = weaveMemoryContext(bodies.join('\n\n'), context.block);
+      try { assertDiscussDeliveryBudget(text); } catch (error) {
+        context.receipt.rejected();
+        log.warn('intake', 'discuss-delivery-over-budget', { key, bytes: Buffer.byteLength(text) });
+        return false;
+      }
       if (messages.some(messageHasVoice)) {
         startReservedRun(msg, text, key, true, project, perm, images, true, msg.content, undefined, context.receipt);
       } else if (action === 'STEER') {
@@ -1528,19 +1534,27 @@ export function createOrchestrator(
         const context = await discuss.context(sessionKey, snapshot.hostId, [...prior.map(m => m.messageId), msg.messageId]);
         context.receipt.signal = signal;
         signal.addEventListener('abort', () => context.receipt.rejected(), { once: true });
+        try {
         const priorBodies = await Promise.all(prior.map(async m => `[discuss-delivery:${m.messageId}]\n发送者 ${m.senderName || m.senderId}：\n${await ingestContext(m, m.content)}`));
         const instruction = text.trim() || '请结合本条 @ 前的群聊消息，回应尚未处理的请求；如果没有明确请求，请询问我需要处理什么。';
         const body = await ingestContext(msg, `[discuss-delivery:${msg.messageId}]\n${instruction}`);
         const history = priorBodies.length ? `[本次 @ 接管的待处理消息简史]\n${priorBodies.join('\n\n')}\n[简史结束]\n` : '';
         const images = (await Promise.all([...prior, msg].map(m => messageHasImages(m) ? collectInboundImages(channel, m) : Promise.resolve([])))).flat();
         signal.throwIfAborted();
-        return { signal, text: weaveMemoryContext(history + body, context.block), images, receipt: context.receipt };
+        const deliveryText = weaveMemoryContext(history + body, context.block);
+        assertDiscussDeliveryBudget(deliveryText);
+        return { signal, text: deliveryText, images, receipt: context.receipt };
+        } catch (error) { context.receipt.rejected(); throw error; }
       }, async input => {
         await handleTurn(msg, text, sessionKey, flat, project, perm, input);
         await input.receipt.settled;
       }, err => {
         finishEarly(msg);
-        void discuss.releaseTakeover(sessionKey, (directHistory.get(msg) ?? []).map(m => m.messageId)).catch(() => undefined);
+        void discuss.releaseTakeover(sessionKey, [...(directHistory.get(msg) ?? []).map(m => m.messageId), msg.messageId]).catch(() => undefined);
+        if (err instanceof DiscussDeliveryBudgetError) {
+          void channel.send(msg.chatId, { markdown: '⚠️ 本次消息及待处理历史超过 256 KiB，尚未提交给模型。请将待处理内容分批发送。' },
+            { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
+        }
         log.fail('intake', err, { phase: 'discuss-direct' });
       });
       return;
