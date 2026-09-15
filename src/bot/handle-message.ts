@@ -94,7 +94,7 @@ import {
 import { buildGoalDoneCard } from '../card/goal-card';
 import { RunCardStream } from '../card/run-card-stream';
 import { buildCleanCard, extractCardFences } from '../card/markdown-render';
-import { imageSources, uploadOutboundImages } from '../card/outbound-images';
+import { imageSources, uploadOutboundImages, StreamingImages } from '../card/outbound-images';
 import {
   buildAutoCompactCard,
   buildCompactFailedCard,
@@ -4173,6 +4173,15 @@ export function createOrchestrator(
         // CardKit streaming entity: body streams with the native typewriter,
         // ⏹/⚙️ ride whole-card updates — both on one card_id (see RunCardStream).
         const stream = queuedCard?.stream ?? new RunCardStream();
+        const liveImages = new StreamingImages(
+          (sources) => uploadOutboundImages(channel, sources, opts.cwd ?? fallbackCwd),
+          () => stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID),
+        );
+        rc.images = liveImages.images;
+        stream.imageWorker = {
+          uploads: liveImages,
+          text: () => rc.rs.blocks.filter((b) => b.kind === 'text').map((b) => b.content).join('\n\n'),
+        };
         const tCreate = Date.now();
         try {
           if (queuedCard) {
@@ -4352,12 +4361,8 @@ export function createOrchestrator(
         await adoptThreadId(finalMsgId);
         rc.cardKey = finalMsgId;
 
-        // Outbound images + 卡片围栏 — only at terminal (uploads are slow; while
-        // streaming, ![](path) refs and ```feishu-card fences show as text). Scan
-        // the final answer once: upload every image ref (cached; covers both the
-        // run-card's inline images and any clean-card images), then post each
-        // ```feishu-card fence as a standalone clean card. Best-effort: a failed
-        // upload leaves the original markdown in place, a failed card is logged.
+        // Resolve final-answer images (successful streaming uploads hit the cache),
+        // retry failures once, and extract standalone clean-card fences.
         const answerText = finalMessageText(rc.rs);
         const { fences } = extractCardFences(answerText);
         const imgSources = imageSources(answerText);
@@ -4649,6 +4654,15 @@ export function createOrchestrator(
     const ensureCard = async (ctx: GoalTurnCtx): Promise<void> => {
       if (ctx.stream) return;
       const stream = new RunCardStream();
+      const liveImages = new StreamingImages(
+        (sources) => uploadOutboundImages(channel, sources, opts.cwd ?? fallbackCwd),
+        () => stream.streamCoalesced(channel, buildRunCard(ctx.rc), ANSWER_EID),
+      );
+      ctx.rc.images = liveImages.images;
+      stream.imageWorker = {
+        uploads: liveImages,
+        text: () => ctx.rc.rs.blocks.filter((b) => b.kind === 'text').map((b) => b.content).join('\n\n'),
+      };
       const cardMsgId = await stream.create(channel, opts.chatId, buildRunCard(ctx.rc), { replyTo, replyInThread });
       ctx.rc.cardKey = cardMsgId;
       ctx.stream = stream;

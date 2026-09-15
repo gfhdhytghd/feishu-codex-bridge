@@ -119,8 +119,7 @@ export interface RunCardState {
   /** goal run cards, after 🎯 结束目标 was tapped: the goal is cleared and this
    * turn is finishing — drop the 结束目标 button (keep ⏹ 终止) and show a notice. */
   goalEnding?: boolean;
-  /** `![](src) → image_key` for the final answer's images (populated at terminal
-   * after upload; absent while streaming, so refs show as text until then). */
+  /** `![](src) → image_key` for images uploaded during streaming or completion. */
   images?: ReadonlyMap<string, string>;
 }
 
@@ -186,7 +185,10 @@ function renderRunning(state: RunState, rc: RunCardState): CardElement[] {
   // appearance is one whole-card update that establishes the element; subsequent
   // growth streams via cardElement.content. Stable element_id ⇒ append-only prefix.
   const answer = textParts.join('\n\n');
-  if (answer) elements.push(mdStream(answer, ANSWER_EID));
+  if (answer) {
+    if (rc.images?.size) elements.push(...renderRichText(answer, rc.images));
+    else elements.push(mdStream(answer, ANSWER_EID));
+  }
 
   // Footer: status (left) + 模型·effort footnote (right) share one row when the
   // 显示模型 pref is on; either alone falls back to a single line.
@@ -273,7 +275,7 @@ function renderTerminal(state: RunState, rc: RunCardState): CardElement[] {
 
   // Terminal answer: split out uploaded images into img elements and drop any
   // ```feishu-card fence (it's hoisted into a standalone clean card). Streaming
-  // still renders plain md (renderRunning) — images aren't uploaded until now.
+  // also resolves images as their background uploads complete.
   if (answer) elements.push(...renderRichText(answer, rc.images));
 
   if (state.terminal === 'interrupted') {

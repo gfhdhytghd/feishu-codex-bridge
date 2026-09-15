@@ -1,3 +1,6 @@
+import { StreamingImages } from '../src/card/outbound-images';
+import { buildRunCard, ANSWER_EID } from '../src/card/run-card';
+import { initialState } from '../src/card/run-state';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RunCardStream } from '../src/card/run-card-stream';
 import { card, mdStream } from '../src/card/cards';
@@ -234,5 +237,51 @@ describe('per-chat 推送共享限速（M-4）', () => {
 
     expect(ch.updates).toHaveLength(2);
     expect(ch.updates[1].at - ch.updates[0].at).toBe(0); // 各自的桶，互不排队
+  });
+});
+
+
+describe('live markdown images', () => {
+  it('repaints the running card after upload without another model event and drains before terminal', async () => {
+    const channel = fakeChannel();
+    const stream = new RunCardStream();
+    const rc = { rs: { ...initialState }, cardKey: 'test', images: new Map<string, string>() };
+    rc.rs.blocks = [{ kind: 'text', id: 'a', streaming: true, content: 'Look ![plot](plot.png)' }];
+    let finish!: (value: Map<string, string>) => void;
+    const upload = vi.fn(() => new Promise<Map<string, string>>((resolve) => { finish = resolve; }));
+    const worker = new StreamingImages(upload, () => stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID));
+    rc.images = worker.images;
+    stream.imageWorker = { uploads: worker, text: () => 'Look ![plot](plot.png)' };
+    await stream.create(channel, 'live-image-test', buildRunCard(rc), {});
+    stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID);
+    await Promise.resolve();
+    stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID);
+    expect(upload).toHaveBeenCalledTimes(1);
+    let drained = false;
+    const drain = stream.drain().then(() => { drained = true; });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    finish(new Map([['plot.png', 'img_live']]));
+    await drain;
+    const last = JSON.parse(channel.updates.at(-1).data);
+    expect(JSON.stringify(last)).toContain('img_live');
+    expect(last.config.streaming_mode).toBe(true);
+    expect(upload).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores incomplete references, caps uploads across frames, and contains failures', async () => {
+    const upload = vi.fn(async () => { throw new Error('offline'); });
+    const repaint = vi.fn();
+    const worker = new StreamingImages(upload, repaint);
+    worker.refresh('![x](partial');
+    await worker.drain();
+    expect(upload).not.toHaveBeenCalled();
+    for (let i = 0; i < 12; i++) worker.refresh(`![x](${i}.png)`);
+    await worker.drain();
+    expect(upload).toHaveBeenCalledTimes(9);
+    worker.refresh('![x](0.png)');
+    await worker.drain();
+    expect(upload).toHaveBeenCalledTimes(9);
+    expect(repaint).not.toHaveBeenCalled();
   });
 });

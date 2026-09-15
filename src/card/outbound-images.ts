@@ -193,3 +193,32 @@ async function uploadBuffer(channel: LarkChannel, buffer: Buffer): Promise<strin
   }
   return key;
 }
+
+/** Per-turn background uploads. Failed sources get one final retry at completion. */
+export class StreamingImages {
+  readonly images = new Map<string, string>();
+  private attempted = new Set<string>();
+  private pending = new Set<Promise<void>>();
+
+  constructor(
+    private upload: (sources: string[]) => Promise<Map<string, string>>,
+    private repaint: () => void,
+  ) {}
+
+  refresh(text: string): void {
+    const fresh = imageSources(text).filter((src) => !this.attempted.has(src))
+      .slice(0, MAX_IMAGES - this.attempted.size);
+    if (!fresh.length) return;
+    for (const src of fresh) this.attempted.add(src);
+    const task = Promise.resolve().then(() => this.upload(fresh)).then((images) => {
+      for (const [src, key] of images) this.images.set(src, key);
+      if (images.size) this.repaint();
+    }).catch((err) => log.fail('outbound', err, { phase: 'stream-images' }));
+    this.pending.add(task);
+    void task.then(() => this.pending.delete(task));
+  }
+
+  async drain(): Promise<void> {
+    while (this.pending.size) await Promise.all(this.pending);
+  }
+}

@@ -1,4 +1,5 @@
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
+import type { StreamingImages } from './outbound-images';
 import { log } from '../core/logger';
 import type { CardObject } from './cards';
 import { isCardIdNotReady } from './managed';
@@ -92,6 +93,8 @@ function isRateLimited(err: unknown): boolean {
  * streams and carries clickable controls (⏹).
  */
 export class RunCardStream {
+  /** Optional per-turn image worker; does not block event consumption. */
+  imageWorker?: { uploads: StreamingImages; text: () => string };
   private cardId = '';
   private _messageId = '';
   private seq = 0;
@@ -150,6 +153,7 @@ export class RunCardStream {
    * event-consume loop instead of awaiting {@link streamCard} per event.
    */
   streamCoalesced(channel: LarkChannel, fullCard: CardObject, answerEid: string | null): void {
+    this.imageWorker?.uploads.refresh(this.imageWorker.text());
     this.pending = { card: fullCard, answerEid };
     this.pumpChannel = channel;
     if (!this.pumpPromise) this.pumpPromise = this.pump();
@@ -158,6 +162,7 @@ export class RunCardStream {
   /** Await any in-flight coalesced push so the final streaming frame lands (and
    * `seq` stays ordered) before the terminal update. Call after the loop ends. */
   async drain(): Promise<void> {
+    await this.imageWorker?.uploads.drain();
     if (this.pumpPromise) await this.pumpPromise;
   }
 
