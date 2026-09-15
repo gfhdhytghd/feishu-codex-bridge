@@ -1561,6 +1561,12 @@ export function createOrchestrator(
   ): Promise<{ thread: AgentThread | undefined; recreated: boolean }> {
     const live = sessions.get(threadId);
     if (live) {
+      if (refreshPreferences && live.getPreferences) {
+        const current = await getSession(threadId);
+        const applied = live.getPreferences();
+        refreshPreferences = current?.fastMode !== applied.fastMode
+          || current?.model !== applied.model || current?.effort !== applied.effort;
+      }
       if (live.isAlive() && !refreshPreferences) return { thread: live, recreated: false };
       // Goals auto-start natively and never pass through turn/start. Resume the
       // same native session with the latest persisted preferences before a goal,
@@ -2160,6 +2166,26 @@ export function createOrchestrator(
     return state;
   }
 
+  async function saveProjectModelForm(project: Project, formValue: Record<string, unknown> | undefined) {
+    const modelId = selectValue(formValue, 'model');
+    const effortRaw = asEffort(selectValue(formValue, 'effort'));
+    const fastRaw = selectValue(formValue, 'fastMode');
+    const fastMode = (project.backend ?? DEFAULT_BACKEND_ID) === DEFAULT_BACKEND_ID
+      ? fastRaw === 'default' ? null : fastRaw === 'on' ? true : fastRaw === 'off' ? false : undefined
+      : undefined;
+    // Fast has its own form: changing it must not freeze a currently inherited
+    // model/effort, and does not depend on model discovery being available.
+    if (!modelId && !effortRaw && fastMode !== undefined) {
+      return performSetModelDefault({ projectName: project.name, fastMode });
+    }
+    const visible = (await listModels(backendFor(project.backend))).filter(x => !x.hidden);
+    const model = modelId ? visible.find(x => x.id === modelId) : visible.length === 1 ? visible[0] : undefined;
+    if (!model) return { ok: false as const, reason: '所选模型无效或已下架，未保存。' };
+    const supported = model.supportedEfforts ?? [];
+    const effort = effortRaw && supported.includes(effortRaw) ? effortRaw : supported.length ? model.defaultEffort : undefined;
+    return performSetModelDefault({ projectName: project.name, model: model.id, effort, fastMode });
+  }
+
   dispatcher
     .on(MC.model, ({ evt, option }) => {
       const state = authPending(modelPending, evt);
@@ -2196,17 +2222,17 @@ export function createOrchestrator(
     })
     .on(MC.fast, ({ evt, option }) => {
       const state = authPending(modelPending, evt);
-      if (!state || state.backend !== DEFAULT_BACKEND_ID || (option !== 'on' && option !== 'off')) return;
+      if (!state || state.backend !== DEFAULT_BACKEND_ID || (option !== 'on' && option !== 'off' && option !== 'default')) return;
       settleUpdate(evt.messageId, async () => {
         const rec = await getSession(state.threadId);
         if (!rec || rec.backend !== state.backend || (state.sessionId && rec.sessionId !== state.sessionId)) {
           state.note = '⚠️ 会话不存在或后端已切换，请重新发 /model';
           return buildModelCard(state);
         }
-        const fastMode = option === 'on';
+        const fastMode = option === 'default' ? null : option === 'on';
         await patchSession(state.threadId, (latest) => latest.sessionId === rec.sessionId && latest.backend === state.backend ? { fastMode } : {});
         state.fastMode = fastMode;
-        state.note = `✅ Fast 已${fastMode ? '开启' : '关闭'}，下一轮生效`;
+        state.note = `✅ Fast ${fastMode === null ? '已恢复沿用 Codex 设置' : fastMode ? '已开启' : '已关闭'}，下一轮生效`;
         return buildModelCard(state);
       });
     })
@@ -3511,23 +3537,11 @@ export function createOrchestrator(
     })
     .on(GS.modelDefaultSubmit, ({ evt, formValue }) => {
       if (!isAdmin(cfg, evt.operator?.openId ?? '')) return;
-      const modelId = selectValue(formValue, 'model');
-      const effortRaw = asEffort(selectValue(formValue, 'effort'));
       void (async () => {
         const project = await getProjectByChatId(evt.chatId);
         if (!project) return;
-        const models = await listModels(backendFor(project.backend));
-        const visible = models.filter((x) => !x.hidden);
-        const m = modelId ? visible.find((x) => x.id === modelId) : visible.length === 1 ? visible[0] : undefined;
-        if (m) {
-          const supported = m.supportedEfforts ?? [];
-          const effort = effortRaw && supported.includes(effortRaw) ? effortRaw : supported.length ? m.defaultEffort : undefined;
-          const fastRaw = selectValue(formValue, 'fastMode');
-          const fastMode = (project.backend ?? DEFAULT_BACKEND_ID) === DEFAULT_BACKEND_ID
-            ? fastRaw === 'on' ? true : fastRaw === 'off' ? false : undefined : undefined;
-          const r = await performSetModelDefault({ projectName: project.name, model: m.id, effort, fastMode });
-          if (r.ok) log.info('console', 'group-model-default', { project: project.name, model: m.id, effort });
-        }
+        const r = await saveProjectModelForm(project, formValue);
+        if (r.ok) log.info('console', 'group-model-default', { project: project.name });
         const fresh = (await getProjectByChatId(evt.chatId)) ?? project;
         await sendManagedCard(channel, evt.chatId, buildGroupSettingsCard(fresh)).catch((e) =>
           log.fail('console', e, { phase: 'group-model-default-result' }),
@@ -3720,29 +3734,12 @@ export function createOrchestrator(
     .on(DM.modelDefaultSubmit, ({ evt, value, formValue }) => {
       if (!dmAdmin(evt.operator?.openId)) return;
       const name = typeof value.n === 'string' ? value.n : '';
-      const modelId = selectValue(formValue, 'model');
-      const effortRaw = asEffort(selectValue(formValue, 'effort'));
       void (async () => {
         const p = await getProjectByName(name);
         if (!p) return;
-        const models = await listModels(backendFor(p.backend));
-        const visible = models.filter((x) => !x.hidden);
-        const m = modelId ? visible.find((x) => x.id === modelId) : visible.length === 1 ? visible[0] : undefined;
-        let notice: string;
-        if (!m) {
-          notice = '⚠️ 所选模型无效或已下架，未保存。';
-        } else {
-          const supported = m.supportedEfforts ?? [];
-          const effort = effortRaw && supported.includes(effortRaw) ? effortRaw : supported.length ? m.defaultEffort : undefined;
-          const fastRaw = selectValue(formValue, 'fastMode');
-          const fastMode = (p.backend ?? DEFAULT_BACKEND_ID) === DEFAULT_BACKEND_ID
-            ? fastRaw === 'on' ? true : fastRaw === 'off' ? false : undefined : undefined;
-          const r = await performSetModelDefault({ projectName: name, model: m.id, effort, fastMode });
-          notice = r.ok
-            ? `✅ 默认已设为「${m.displayName}」${effort ? ` · 强度 ${effort}` : ''}，新话题生效。`
-            : `⚠️ ${r.reason}`;
-          if (r.ok) log.info('console', 'project-model-default', { project: name, model: m.id, effort });
-        }
+        const r = await saveProjectModelForm(p, formValue);
+        const notice = r.ok ? '✅ 默认设置已保存，新话题生效。' : `⚠️ ${r.reason}`;
+        if (r.ok) log.info('console', 'project-model-default', { project: name });
         const fresh = (await getProjectByName(name)) ?? p;
         await sendManagedCard(
           channel,
@@ -3913,7 +3910,7 @@ export function createOrchestrator(
     knownThreadId?: string;
     model?: string;
     effort?: ReasoningEffort;
-    fastMode?: boolean;
+    fastMode?: boolean | null;
     cwd?: string;
     summary?: string;
     /** who triggered this run (for ⏹/⚙️ ownership gating) */
@@ -4170,7 +4167,7 @@ export function createOrchestrator(
         const turnModel = rec?.model ?? opts.model;
         const turnEffort = rec?.effort ?? opts.effort;
         const modelDisp = getModelDisplay(cfg);
-        const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort, fastMode: rec?.fastMode ?? opts.fastMode });
+        const run = opts.thread.runStreamed(turnInput, { model: turnModel, effort: turnEffort, fastMode: rec ? rec.fastMode : opts.fastMode });
         titleTurnAttempted = true;
         const turnStartAt = Date.now(); // turn/start 已在 runStreamed() 内发出（与下面的建卡并行）
         state.run = run;
@@ -5068,7 +5065,7 @@ export function createOrchestrator(
           sessionId: rec.sessionId,
           model: rec.model,
           effort: rec.effort,
-        fastMode: rec.fastMode,
+          fastMode: rec.fastMode,
         });
         trackSession(sessionKey, resumed);
         commentInstrUsed.set(sessionKey, instructions);

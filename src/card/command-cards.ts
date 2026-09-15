@@ -41,7 +41,7 @@ export interface ModelCardState {
   models: ModelInfo[];
   model: string;
   effort: ReasoningEffort;
-  fastMode?: boolean;
+  fastMode?: boolean | null;
   /** the backend whose models this card lists（写回会话前复核，防跨后端把一个后端的
    * model id 持久化进另一后端的会话——resume 时会喂坏 CLI）。旧卡缺省。 */
   backend?: string;
@@ -106,9 +106,9 @@ export function buildModelCard(state: ModelCardState): CardObject {
     elements.push(hr(), md('⚡ **Fast 模式**'), actions([selectStatic({
       actionId: MC.fast,
       placeholder: 'Fast 模式',
-      initial: state.fastMode === undefined ? 'default' : state.fastMode ? 'on' : 'off',
+      initial: state.fastMode == null ? 'default' : state.fastMode ? 'on' : 'off',
       options: [
-        ...(state.fastMode === undefined ? [{ label: '沿用 Codex 设置（未覆盖）', value: 'default' }] : []),
+        { label: '沿用 Codex 设置（未覆盖）', value: 'default' },
         { label: 'Fast：开启', value: 'on' },
         { label: 'Fast：关闭', value: 'off' },
       ],

@@ -438,3 +438,13 @@ describe('persist Fast project defaults', () => {
   });
 });
 
+
+
+it('restores Fast inheritance durably without selecting model or effort', async () => {
+  await performSetModelDefault({ projectName: 'demo', fastMode: true });
+  await performSetModelDefault({ projectName: 'demo', fastMode: null });
+  const project = await getProjectByName('demo');
+  expect(project?.defaultFastMode).toBeNull();
+  expect(project?.defaultModel).toBeUndefined();
+  expect(project?.defaultEffort).toBeUndefined();
+});

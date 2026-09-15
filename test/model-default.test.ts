@@ -155,3 +155,13 @@ describe('Fast defaults', () => {
     expect(modelDefaultSummary({})).not.toContain('Fast');
   });
 });
+
+
+it('keeps a separate Fast-only form and always offers inherited settings', () => {
+  const j = json({ name: 'p', defaultFastMode: true }, [], 'dm');
+  expect(j).toContain('"name":"fast_default"');
+  expect(j).not.toContain('"name":"model_default"');
+  expect(j).toContain('沿用 Codex 设置');
+  expect(j).toContain('"value":"default"');
+  expect(modelDefaultSummary({ defaultFastMode: null })).not.toContain('Fast 关闭');
+});

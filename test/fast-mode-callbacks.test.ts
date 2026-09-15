@@ -52,7 +52,8 @@ async function openModel() {
 }
 beforeEach(() => {
   vi.clearAllMocks();
-  const makeThread = () => ({
+  const makeThread = (opts: { fastMode?: boolean | null }) => ({
+    getPreferences: () => opts,
     sessionId: 'host', isAlive: () => true, close: fake.close,
     clearGoal: async () => undefined,
     runGoal: (objective: string) => {
@@ -60,8 +61,8 @@ beforeEach(() => {
       return { events: (async function* () {})(), turnId: () => undefined };
     },
   });
-  fake.start.mockImplementation(async () => makeThread());
-  fake.resume.mockImplementation(async () => makeThread());
+  fake.start.mockImplementation(async opts => makeThread(opts));
+  fake.resume.mockImplementation(async opts => makeThread(opts));
   fake.project = { name: 'p', chatId: 'chat', cwd: '/tmp', blank: false, createdAt: 1, backend: 'codex-appserver', defaultFastMode: true };
   fake.rec = { threadId: 'topic', chatId: 'chat', cwd: '/tmp', sessionId: 'host', backend: 'codex-appserver', model: 'only', effort: 'medium', fastMode: true, summary: '', createdAt: 1, updatedAt: 1 };
   orchestrator = createOrchestrator({ send: vi.fn(async () => ({})), rawClient: { im: { v1: { messageReaction: { create: async () => ({ data: {} }) } } } } } as never, cfg, '/tmp');
@@ -139,4 +140,56 @@ describe('Fast session lifecycle', () => {
     expect(fake.resume.mock.invocationCallOrder[0]).toBeLessThan(fake.goal.mock.invocationCallOrder[0]!);
     await vi.waitFor(() => expect(fake.close).toHaveBeenCalledTimes(2));
   });
+});
+
+
+describe('Fast inheritance and unchanged goals', () => {
+  it('restores inherited Fast on the current session', async () => {
+    await openModel();
+    await orchestrator.dispatcher.handle(event(MC.fast, 'default'));
+    await vi.waitFor(() => expect(fake.rec?.fastMode).toBeNull());
+    expect(JSON.stringify(fake.update.mock.calls)).toContain('已恢复沿用 Codex 设置');
+  });
+  it.each([GS.modelDefaultSubmit, DM.modelDefaultSubmit])('saves only Fast without pinning a model through %s', async action => {
+    await orchestrator.dispatcher.handle(event(action, undefined, 'owner', { fastMode: 'default' }));
+    await vi.waitFor(() => expect(fake.project.defaultFastMode).toBeNull());
+    expect(fake.project.defaultModel).toBeUndefined();
+    expect(fake.project.defaultEffort).toBeUndefined();
+  });
+  it.each([true, false, null, undefined])('keeps a live thread for a goal when Fast=%s is unchanged', async fastMode => {
+    fake.project.kind = 'single';
+    fake.rec!.fastMode = fastMode;
+    await message('/clear');
+    await vi.waitFor(() => expect(fake.send).toHaveBeenCalled());
+    await message('/goal continue');
+    await vi.waitFor(() => expect(fake.goal).toHaveBeenCalled());
+    expect(fake.resume).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(fake.close).toHaveBeenCalledTimes(1));
+  });
+});
+
+
+it.each(['model', 'effort'] as const)('refreshes a goal only when the applied %s changed', async key => {
+  fake.project.kind = 'single';
+  await message('/clear');
+  await vi.waitFor(() => expect(fake.send).toHaveBeenCalled());
+  if (key === 'model') fake.rec!.model = 'other';
+  else fake.rec!.effort = 'high';
+  await message('/goal use new preferences');
+  await vi.waitFor(() => expect(fake.goal).toHaveBeenCalled());
+  expect(fake.resume).toHaveBeenCalledWith(expect.objectContaining({ [key]: fake.rec![key] }));
+  await vi.waitFor(() => expect(fake.close).toHaveBeenCalledTimes(2));
+});
+
+it('saves Fast while model discovery is empty without changing explicit model defaults', async () => {
+  const previous = fake.models;
+  fake.models = [];
+  fake.project.defaultModel = 'keep-model';
+  fake.project.defaultEffort = 'high';
+  try {
+    await orchestrator.dispatcher.handle(event(GS.modelDefaultSubmit, undefined, 'owner', { fastMode: 'off' }));
+    await vi.waitFor(() => expect(fake.project.defaultFastMode).toBe(false));
+    expect(fake.project.defaultModel).toBe('keep-model');
+    expect(fake.project.defaultEffort).toBe('high');
+  } finally { fake.models = previous; }
 });

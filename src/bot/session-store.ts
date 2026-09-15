@@ -27,7 +27,8 @@ export interface SessionRecord {
   titleJobKey?: string;
   model?: string;
   effort?: ReasoningEffort;
-  fastMode?: boolean;
+  /** null explicitly restores Codex configuration; absent preserves imported native settings. */
+  fastMode?: boolean | null;
   /** first user message excerpt, for context */
   summary: string;
   /** createTime (epoch ms) of the most recent message woven into this session —
