@@ -1,3 +1,4 @@
+import { steerWithDeadline, isRejectedSteer } from './steer-delivery';
 import type {
   BotAddedEvent,
   CardActionEvent,
@@ -1270,15 +1271,21 @@ export function createOrchestrator(
         await replyGoalBusy(msg, flat);
         return;
       }
-      if (getPendingPolicy(cfg) === 'steer' && cur.run && cur.thread) {
+      if (getPendingPolicy(cfg) === 'steer' && backendFor(project?.backend).capabilities?.steer !== false && cur.run && cur.thread) {
         const tid = cur.run.turnId();
         if (tid) {
           try {
-            await cur.thread.steer({ text: woven, images }, tid);
+            await steerWithDeadline(cur.thread, { text: woven, images }, tid);
             log.info('intake', 'steer', { tid, images: images?.length ?? 0 });
             return;
           } catch (err) {
             log.warn('intake', 'steer-failed', { err: String(err) });
+            if (!isRejectedSteer(err)) {
+              void channel.send(msg.chatId,
+                { markdown: '⚠️ 本条消息的接收确认失败，可能已进入模型。为避免重复执行，未自动重投；请先核对本轮结果。' },
+                { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
+              return;
+            }
           }
         }
       }

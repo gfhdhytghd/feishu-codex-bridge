@@ -1,14 +1,16 @@
+import { JsonRpcError } from '../src/agent/codex-appserver/app-server-client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import type { AgentEvent, AgentInput } from '../src/agent/types';
 
 const fake = vi.hoisted(() => ({
-  backend: { id: 'codex', listModels: vi.fn(async () => []), resumeThread: vi.fn(), startThread: vi.fn() },
+  backend: { capabilities: { steer: true }, id: 'codex', listModels: vi.fn(async () => []), resumeThread: vi.fn(), startThread: vi.fn() },
   final: vi.fn(async () => true),
   createCard: vi.fn(async () => 'card'),
   send: vi.fn(async () => ({})),
   log: { info: vi.fn(), warn: vi.fn(), fail: vi.fn() },
 }));
+vi.mock('../src/bot/steer-delivery', async original => { const real = await original<typeof import('../src/bot/steer-delivery')>(); return { ...real, steerWithDeadline: (thread: any, input: any, id: string) => real.steerWithDeadline(thread, input, id, undefined, 150) }; });
 vi.mock('../src/core/logger', () => ({ log: fake.log, withTrace: (_ctx: unknown, fn: () => unknown) => fn() }));
 vi.mock('../src/agent', async (original) => ({ ...await original<object>(), createBackend: () => fake.backend }));
 vi.mock('../src/project/registry', async (original) => ({
@@ -83,6 +85,7 @@ function setup(policy: 'steer' | 'queue' = 'steer') {
 }
 beforeEach(() => {
   vi.clearAllMocks();
+  fake.backend.capabilities.steer = true;
   fake.final.mockReset().mockResolvedValue(true);
   fake.createCard.mockReset().mockResolvedValue('card');
   fake.send.mockReset().mockResolvedValue({});
@@ -105,7 +108,7 @@ describe('message queue lifecycle', () => {
     await until(() => expect(run.t.steer).toHaveBeenCalledTimes(1));
     run.turns[0]!.resolve();
     await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.anything()));
-    steer.reject(new Error('turn already completed'));
+    steer.reject(new JsonRpcError('turn already completed'));
     await until(() => expect(run.consumed).toHaveLength(2));
     expect(run.consumed[1]!.text).toContain('follow-up');
     run.turns[1]!.resolve();
@@ -125,7 +128,7 @@ describe('message queue lifecycle', () => {
     await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.anything()));
     await o.onMessage(message('replacement'));
     await until(() => expect(run.consumed).toHaveLength(2));
-    steer.reject(new Error('old turn gone'));
+    steer.reject(new JsonRpcError('no active turn'));
     await until(() => expect(fake.log.info).toHaveBeenCalledWith('intake', 'queued', { depth: 1 }));
     run.turns[1]!.resolve();
     await until(() => expect(run.consumed).toHaveLength(3));
@@ -192,4 +195,34 @@ describe('message queue lifecycle', () => {
     }, expect.anything()));
   });
 
+});
+
+it.each(['disconnect', 'missing-response'])('does not replay uncertain steer delivery: %s', async failure => {
+ const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
+ const o = setup(); await o.onMessage(message('first'));
+ await until(() => expect(run.consumed).toHaveLength(1));
+ const pending = deferred<void>();
+ run.t.steer.mockImplementationOnce(async () => { if (failure === 'disconnect') throw new Error('connection lost after write'); await pending.promise; });
+ await o.onMessage(message('perform exactly once'));
+ await until(() => expect(fake.send.mock.calls.some(c => JSON.stringify(c).includes('未自动重投'))).toBe(true));
+ run.turns[0]!.resolve(); pending.resolve();
+ await until(() => expect(fake.log.info).toHaveBeenCalledWith('card', 'final', expect.anything()));
+ await o.onMessage(message('next request'));
+ await until(() => expect(run.consumed).toHaveLength(2));
+ expect(run.consumed[1]!.text).toContain('next request');
+ expect(run.consumed[1]!.text).not.toContain('perform exactly once');
+ run.turns[1]!.resolve();
+});
+
+it('queues directly when the backend does not support steer', async () => {
+ fake.backend.capabilities.steer = false;
+ const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
+ const o = setup(); await o.onMessage(message('first'));
+ await until(() => expect(run.consumed).toHaveLength(1));
+ await o.onMessage(message('second'));
+ expect(run.t.steer).not.toHaveBeenCalled();
+ run.turns[0]!.resolve();
+ await until(() => expect(run.consumed).toHaveLength(2));
+ expect(run.consumed[1]!.text).toContain('second');
+ run.turns[1]!.resolve();
 });

@@ -118,6 +118,8 @@ export class AppServerClient {
       this.notifications.close();
     });
     child.on('error', (err) => this.failAllPending(err));
+    // Writable streams emit their own error in addition to write callbacks.
+    child.stdin.on('error', (err) => this.failAllPending(err));
 
     await this.request('initialize', {
       clientInfo: { name: this.opts.clientName ?? 'feishu-codex-bridge', version: '0.0.1' },
@@ -130,15 +132,23 @@ export class AppServerClient {
     this.notify('initialized');
   }
 
-  request<T = unknown>(method: string, params?: unknown): Promise<T> {
+  request<T = unknown>(method: string, params?: unknown, timeoutMs?: number): Promise<T> {
     if (this.closed || !this.child) return Promise.reject(new Error('app-server client closed'));
     const id = ++this.nextId;
     const payload = `${JSON.stringify({ jsonrpc: '2.0', id, method, params: params ?? {} })}\n`;
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+      const timer = timeoutMs === undefined ? undefined : setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`RPC ${method} response timed out; delivery unknown`));
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: value => { clearTimeout(timer); resolve(value as T); },
+        reject: error => { clearTimeout(timer); reject(error); },
+      });
       this.child!.stdin.write(payload, (err) => {
         if (err) {
           this.pending.delete(id);
+          clearTimeout(timer);
           reject(err);
         }
       });

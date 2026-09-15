@@ -452,7 +452,7 @@ class CodexThread implements AgentThread {
       threadId: this.sessionId,
       expectedTurnId,
       input: toUserInput(input),
-    });
+    }, 30_000);
   }
 
   async abort(turnId: string): Promise<void> {

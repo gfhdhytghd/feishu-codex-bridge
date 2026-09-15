@@ -1,3 +1,4 @@
+import { AppServerClient } from '../src/agent/codex-appserver/app-server-client';
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -202,4 +203,18 @@ describe.skipIf(process.platform === 'win32')('容量 1 预热池（M-2）', () 
 
     await Promise.allSettled([t1.close(), t2.close()]);
   });
+});
+
+it('bounds a missing RPC response without killing unrelated requests', async () => {
+  const { bin } = makeFakeCodex();
+  const client = new AppServerClient({ bin, cwd: '/tmp' });
+  try {
+    await client.connect();
+    const hanging = client.request('hang', {}, 30);
+    const timedOut = expect(hanging).rejects.toThrow('delivery unknown');
+    await expect(client.request('model/list', {})).resolves.toHaveProperty('data');
+    await timedOut;
+    expect((client as any).pending.size).toBe(0);
+    await expect(client.request('model/list', {}, 1000)).resolves.toHaveProperty('data');
+  } finally { await client.close(); }
 });
