@@ -182,3 +182,10 @@ describe('ordered preparation', () => {
     release(); await vi.waitFor(() => expect(delivered).toEqual(['new'])); lane.close();
   });
 });
+
+it('passes the per-project model and Fast override to the briefing runner', async () => {
+  const { c, factory } = setup([msg('old', '字'.repeat(2000))], { enabled: false });
+  const result = await c.prepare(input(), 'key', signal(), undefined, true, { enabled: true, model: 'gpt-5.6-sol', fast: true });
+  expect(factory).toHaveBeenCalledWith('gpt-5.6-sol', expect.any(AbortSignal), true);
+  result.receipt.rejected();
+});

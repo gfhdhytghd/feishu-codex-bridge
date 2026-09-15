@@ -126,6 +126,7 @@ import {
   buildGroupSettingsCard,
   buildJoinGroupFormCard,
   buildModelDefaultCard,
+  buildBriefingModelCard,
   buildNewProjectDoneCard,
   buildNewProjectFormCard,
   buildPermissionCard,
@@ -668,7 +669,7 @@ export function createOrchestrator(
   cliBridge?: CliBridgeRuntimeHooks,
 ): Orchestrator {
   const contextConfig = cfg.preferences?.contextBriefing;
-  const briefings = contextConfig ? new ContextBriefing(
+  let briefings = contextConfig ? new ContextBriefing(
     new ChatHistory(channel, contextConfig.archivePath, contextConfig.pythonCommand), contextConfig,
     `${paths.sessionsFile}.context.json`,
   ) : undefined;
@@ -731,7 +732,10 @@ export function createOrchestrator(
   const discuss = new Discuss(`${paths.sessionsFile}.discuss.json`,
     new ChatHistory(channel, contextConfig?.archivePath, contextConfig?.pythonCommand), {
     snapshot: discussSnapshot,
-
+    summaryPolicy: async (_key, msg) => {
+      const p = await getProjectByChatId(msg.chatId);
+      return { enabled: p?.contextBriefing !== false, model: p?.contextBriefingModel ?? 'gpt-5.6-luna', fast: p?.contextBriefingFast ?? false };
+    },
 
     enabled: async (key, msg) => {
       const p = await getProjectByChatId(msg.chatId);
@@ -1082,6 +1086,9 @@ export function createOrchestrator(
     }
 
     const project = await getProjectByChatId(msg.chatId);
+    if (!briefings && project && (project.contextBriefing !== undefined || project.contextBriefingModel || project.contextBriefingFast !== undefined)) {
+      briefings = new ContextBriefing(new ChatHistory(channel, contextConfig?.archivePath, contextConfig?.pythonCommand), contextConfig ?? {}, `${paths.sessionsFile}.context.json`);
+    }
     if (project && isChatAllowed(cfg, msg.chatId) && isUserAllowedInProject(cfg, project, msg.senderId)) briefings?.observe(msg);
     if (project && discussEnabled(project) && isChatAllowed(cfg, msg.chatId) && isUserAllowedInProject(cfg, project, msg.senderId)) {
       const key = turnSession(msg.chatId, project, msg.senderId).sessionKey;
@@ -1488,7 +1495,7 @@ export function createOrchestrator(
         const baseline = await getSession(sessionKey);
         const currentProject = await getProjectByChatId(msg.chatId);
         const [context, body, images] = await Promise.all([
-          currentBriefings.prepare(msg, sessionKey, signal, baseline, currentProject?.contextBriefing !== false), ingestContext(msg, text),
+          currentBriefings.prepare(msg, sessionKey, signal, baseline, currentProject?.contextBriefing !== false, { enabled: currentProject?.contextBriefing, model: currentProject?.contextBriefingModel, fast: currentProject?.contextBriefingFast }), ingestContext(msg, text),
           messageHasImages(msg) ? collectInboundImages(channel, msg) : Promise.resolve(undefined),
         ]);
         return { signal, text: weaveMemoryContext(body, context.block), images, receipt: context.receipt };
@@ -2011,7 +2018,7 @@ export function createOrchestrator(
         const body = await ingestContext(msg, text);
         if (!briefings || goal) return body;
         const currentProject = await getProjectByChatId(msg.chatId);
-        const context = await briefings.prepare(msg, `pending:${msg.messageId}`, new AbortController().signal, undefined, currentProject?.contextBriefing !== false);
+        const context = await briefings.prepare(msg, `pending:${msg.messageId}`, new AbortController().signal, undefined, currentProject?.contextBriefing !== false, { enabled: currentProject?.contextBriefing, model: currentProject?.contextBriefingModel, fast: currentProject?.contextBriefingFast });
         contextReceipt = context.receipt;
         return weaveMemoryContext(body, context.block);
       })();
@@ -3808,8 +3815,22 @@ export function createOrchestrator(
         return buildGroupSettingsCard(result.ok ? result.project : project);
       });
     })
-
-
+    .on(GS.briefingModel, ({ evt }) => {
+      if (!isAdmin(cfg, evt.operator?.openId ?? '')) return;
+      patch(evt, async () => {
+        const p = await getProjectByChatId(evt.chatId);
+        return p ? buildBriefingModelCard(p, await listModels(backendFor(DEFAULT_BACKEND_ID)), 'group') : buildGroupSettingsCard({ name: '本群', kind: 'multi' });
+      });
+    })
+    .on(GS.briefingModelSubmit, ({ evt, formValue }) => {
+      if (!isAdmin(cfg, evt.operator?.openId ?? '')) return;
+      patch(evt, async () => {
+        const p = await getProjectByChatId(evt.chatId);
+        if (!p) return buildGroupSettingsCard({ name: '本群', kind: 'multi' });
+        const result = await performSetContextBriefing({ projectName: p.name, model: selectValue(formValue, 'model'), fast: selectValue(formValue, 'fast') === 'on' });
+        return result.ok ? buildGroupSettingsCard(result.project) : buildBriefingModelCard(p, await listModels(backendFor(DEFAULT_BACKEND_ID)), 'group', result.reason);
+      });
+    })
     .on(GS.setContextBriefing, ({ evt, value }) => {
       if (!isAdmin(cfg, evt.operator?.openId ?? '') || !['on', 'off'].includes(String(value.v))) return;
       patch(evt, async () => {
@@ -4010,8 +4031,22 @@ export function createOrchestrator(
           : buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
       });
     })
-
-
+    .on(DM.briefingModel, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      patch(evt, async () => {
+        const p = await getProjectByName(String(value.n ?? ''));
+        return p ? buildBriefingModelCard(p, await listModels(backendFor(DEFAULT_BACKEND_ID)), 'dm') : buildDmMenuCard({});
+      });
+    })
+    .on(DM.briefingModelSubmit, ({ evt, value, formValue }) => {
+      if (!dmAdmin(evt.operator?.openId)) return;
+      patch(evt, async () => {
+        const p = await getProjectByName(String(value.n ?? ''));
+        if (!p) return buildDmMenuCard({});
+        const result = await performSetContextBriefing({ projectName: p.name, model: selectValue(formValue, 'model'), fast: selectValue(formValue, 'fast') === 'on' });
+        return result.ok ? buildProjectSettingsCard(result.project, backendDisplayName(result.project.backend)) : buildBriefingModelCard(p, await listModels(backendFor(DEFAULT_BACKEND_ID)), 'dm', result.reason);
+      });
+    })
     .on(DM.setContextBriefingDm, ({ evt, value }) => {
       if (!dmAdmin(evt.operator?.openId) || !['on', 'off'].includes(String(value.v))) return;
       const name = typeof value.n === 'string' ? value.n : '';

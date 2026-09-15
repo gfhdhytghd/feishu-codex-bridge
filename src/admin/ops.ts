@@ -47,7 +47,7 @@ export type AdminWriteOp =
     }
   | { kind: 'setNoMention'; project: string; on: boolean }
   | { kind: 'setAutoCompact'; project: string; on: boolean }
-  | { kind: 'setContextBriefing'; project: string; on: boolean }
+  | { kind: 'setContextBriefing'; project: string; on?: boolean; model?: string; fast?: boolean }
   | { kind: 'setDiscuss'; project: string; on: boolean }
   | {
       kind: 'setCompletionReminder';
@@ -282,12 +282,15 @@ export async function performSetDiscuss(opts: { projectName: string; on: boolean
 }
 
 /** Per-project briefing policy, read at intake; never interrupts a live turn. */
-export async function performSetContextBriefing(opts: { projectName: string; on: boolean }): Promise<AdminWriteOutcome> {
-  if (typeof opts.on !== 'boolean') return { ok: false, reason: '上下文策略开关必须是布尔值' };
+export async function performSetContextBriefing(opts: { projectName: string; on?: boolean; model?: string; fast?: boolean }): Promise<AdminWriteOutcome> {
+  if ((opts.on !== undefined && typeof opts.on !== 'boolean') || (opts.fast !== undefined && typeof opts.fast !== 'boolean')) return { ok: false, reason: '消息简史和 Fast 开关必须是布尔值' };
+  if (opts.model !== undefined && (typeof opts.model !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,159}$/.test(opts.model))) return { ok: false, reason: '无效的消息总结模型 ID' };
+  if (opts.on === undefined && opts.model === undefined && opts.fast === undefined) return { ok: false, reason: '未提供消息简史设置' };
   const p = await getProjectByName(opts.projectName);
   if (!p) return { ok: false, reason: `项目「${opts.projectName}」不存在` };
-  await updateProject(opts.projectName, { contextBriefing: opts.on });
-  return { ok: true, project: await freshOr(opts.projectName, { ...p, contextBriefing: opts.on }) };
+  const patch = { contextBriefing: opts.on, contextBriefingModel: opts.model, contextBriefingFast: opts.fast };
+  await updateProject(opts.projectName, patch);
+  return { ok: true, project: await freshOr(opts.projectName, p) };
 }
 
 /** 🗜️ 自动压缩开关（DM dm.proj.autoCompact / gs.autoCompact 与 Web 同源）：
@@ -411,7 +414,7 @@ export async function runAdminWriteOp(
     case 'setDiscuss':
       return performSetDiscuss({ projectName: op.project, on: op.on });
     case 'setContextBriefing':
-      return performSetContextBriefing({ projectName: op.project, on: op.on });
+      return performSetContextBriefing({ projectName: op.project, on: op.on, model: op.model, fast: op.fast });
     case 'setAutoCompact':
       return performSetAutoCompact({
         projectName: op.project,

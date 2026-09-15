@@ -454,3 +454,14 @@ describe('createAdminWriteExecutor / runAdminWriteOp（Web · IPC 入口）', ()
     ).rejects.toBeInstanceOf(AdminWriteError);
   });
 });
+
+
+it('changes history model and Fast while preserving independent project switches', async () => {
+  await updateProject('demo', { contextBriefing: false, discuss: true, defaultModel: 'main-model' });
+  expect((await performSetContextBriefing({ projectName: 'demo', model: 'gpt-5.6-sol', fast: true })).ok).toBe(true);
+  expect(await getProjectByName('demo')).toMatchObject({ contextBriefing: false, contextBriefingModel: 'gpt-5.6-sol', contextBriefingFast: true, discuss: true, defaultModel: 'main-model' });
+  expect((await performSetContextBriefing({ projectName: 'demo', on: true })).ok).toBe(true);
+  expect((await getProjectByName('demo'))?.contextBriefingFast).toBe(true);
+  expect((await performSetContextBriefing({ projectName: 'demo', fast: 'true' as never })).ok).toBe(false);
+  expect((await performSetContextBriefing({ projectName: 'demo', model: '' })).ok).toBe(false);
+});

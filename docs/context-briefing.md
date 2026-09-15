@@ -84,3 +84,7 @@ npx vitest run test/briefing-live.test.ts
 
 The live history test only reads; it does not send messages. `BRIEFING_HISTORY_DAYS`
 changes its probe window only, not production defaults.
+
+### Project model and Fast
+
+Project settings expose `contextBriefing` (enabled), `contextBriefingModel` (default `gpt-5.6-luna`) and `contextBriefingFast` (default false). Group settings and the DM project card provide a model selector and Fast switch; Web accepts a model ID and has the same switches. Partial writes preserve all other options. These settings also control Discuss's continuous message summary independently of its reply judge. Disabling summary keeps raw history available.

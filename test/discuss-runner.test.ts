@@ -43,3 +43,12 @@ it('cleans the private snapshot and preserves the RPC error when fork fails', as
   await expect(stat(mock.home)).rejects.toMatchObject({ code: 'ENOENT' });
   expect(await readFile(source, 'utf8')).toBe('unchanged');
 });
+
+it.each([true, false])('sends explicit Fast=%s to both thread and turn', async fast => {
+  mock.requests = [];
+  const model = await createDiscussModel({ model: 'gpt-5.6-luna', effort: 'low', instructions: 'summary', fast }, new AbortController().signal);
+  try {
+    await expect(model.ask('summarize', {}, new AbortController().signal)).rejects.toThrow('Auxiliary stream closed');
+    for (const method of ['thread/start', 'turn/start']) expect(mock.requests.find(r => r.method === method)?.params.serviceTier).toBe(fast ? 'fast' : null);
+  } finally { await model.close(); }
+});

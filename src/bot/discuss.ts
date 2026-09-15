@@ -20,13 +20,15 @@ export interface DiscussSnapshot {
 }
 interface Entry { batch?: number; assistant?: boolean; seq: number; msg: NormalizedMessage; state: 'pending' | 'followup' | 'unknown' | 'accepted' | 'ignored' | 'cancelled'; hostId?: string }
 interface Summary { version: number; covered: number; body: string; gaps?: string[] }
-interface Lane { summaryGeneration?: number; lunaId?: string; entries: Entry[]; summary?: Summary; injected: Record<string, number>; rawInjected?: Record<string, number>; generation: number; next: number; nextBatch?: number }
+interface Lane { cancelGeneration?: number; summaryGeneration?: number; lunaId?: string; entries: Entry[]; summary?: Summary; injected: Record<string, number>; rawInjected?: Record<string, number>; generation: number; next: number; nextBatch?: number }
 interface State { version: 1; lanes: Record<string, Lane> }
 interface Decision { messageId: string; action: DiscussAction; reason: string }
 interface Judgment { hostId: string; runId: string | null; decisions: Decision[]; lookup: Lookup | null }
 interface Lookup { kind: 'file' | 'search' | 'before' | 'around'; path: string; query: string; messageId: string; beforeMs: number }
-interface Runtime { judge?: BriefingModel; luna?: DiscussModel; signature?: string; batches: number; chars: number; judgeBusy: boolean; lunaBusy: boolean; firstAt?: number; due?: number; controllers: Set<AbortController>; judgeRetryAt?: number; lunaRetryAt?: number; reconcileAt?: number; controlAt?: number }
+interface Runtime { summaryPolicy?: string; summaryEnabled?: boolean; judge?: BriefingModel; luna?: DiscussModel; signature?: string; batches: number; chars: number; judgeBusy: boolean; lunaBusy: boolean; firstAt?: number; due?: number; controllers: Set<AbortController>; judgeRetryAt?: number; lunaRetryAt?: number; reconcileAt?: number; controlAt?: number }
+export interface SummaryPolicy { enabled: boolean; model: string; fast: boolean }
 export interface DiscussHooks {
+  summaryPolicy?(key: string, msg: NormalizedMessage): Promise<SummaryPolicy>;
   enabled?(key: string, msg: NormalizedMessage): Promise<boolean>;
   snapshot(key: string, msg: NormalizedMessage): Promise<DiscussSnapshot>;
   deliver(key: string, messages: NormalizedMessage[], action: Exclude<DiscussAction, 'IGNORE'>, snapshot: DiscussSnapshot, context: PreparedContext): Promise<boolean>;
@@ -188,10 +190,16 @@ export class Discuss {
     }
     await this.save();
   }
+  private async policy(key: string, lane: Lane): Promise<SummaryPolicy> {
+    return this.hooks.summaryPolicy && lane.entries.length ? this.hooks.summaryPolicy(key, lane.entries.at(-1)!.msg)
+      : { enabled: true, model: 'gpt-5.6-luna', fast: false };
+  }
   /** Main accepts only a completed snapshot; never waits for Luna. */
   async context(key: string, hostId: string, ids: string[] = []): Promise<PreparedContext> {
     await this.loaded;
-    const lane = this.lane(key), summary = lane.summary;
+    const lane = this.lane(key);
+    const policy = await this.policy(key, lane);
+    const summary = policy.enabled ? lane.summary : undefined;
     for (const e of lane.entries) if (ids.includes(e.msg.messageId)) e.hostId = hostId;
     if (ids.length) await this.save();
     const fresh = summary && (lane.injected[hostId] ?? 0) < summary.version;
@@ -200,11 +208,11 @@ export class Discuss {
     let settle!: () => void;
     const settled = new Promise<void>(r => { settle = r; });
     let done = false;
-    const generation = lane.summaryGeneration ?? 0;
+    const generation = lane.cancelGeneration ?? 0;
     const receipt: ContextReceipt = { settled,
       accepted: (_key, acceptedHost = hostId) => {
         if (done) return;
-        if (this.closed || generation !== (lane.summaryGeneration ?? 0) || receipt.signal?.aborted) { done = true; settle(); return; }
+        if (this.closed || generation !== (lane.cancelGeneration ?? 0) || receipt.signal?.aborted) { done = true; settle(); return; }
         done = true;
         if (fresh && summary) lane.injected[acceptedHost] = summary.version;
         if (rawThrough) (lane.rawInjected ??= {})[acceptedHost] = rawThrough;
@@ -217,6 +225,7 @@ export class Discuss {
   cancel(key: string): void {
     const lane = this.state.lanes[key]; if (!lane) return;
     lane.generation++;
+    lane.cancelGeneration = (lane.cancelGeneration ?? 0) + 1;
     lane.summaryGeneration = (lane.summaryGeneration ?? 0) + 1;
     for (const e of lane.entries) if (['pending', 'followup'].includes(e.state)) e.state = 'cancelled';
     const rt = this.runtime(key); for (const c of rt.controllers) c.abort();
@@ -263,6 +272,13 @@ export class Discuss {
           continue;
         }
       }
+      const policy = await this.policy(key, lane);
+      const policyKey = JSON.stringify(policy);
+      if (rt.summaryPolicy !== policyKey) {
+        lane.summaryGeneration = (lane.summaryGeneration ?? 0) + 1;
+        void rt.luna?.close(); rt.luna = undefined;
+        rt.summaryPolicy = policyKey; rt.summaryEnabled = policy.enabled; rt.lunaRetryAt = undefined;
+      }
       if (rt.due && Date.now() < rt.due) continue;
       rt.firstAt = rt.due = undefined;
       const unbatched = lane.entries.filter(e => e.batch === undefined);
@@ -271,7 +287,7 @@ export class Discuss {
         for (const entry of unbatched) entry.batch = batch;
         await this.save();
       }
-      if (!rt.lunaBusy && Date.now() >= (rt.lunaRetryAt ?? 0) && this.lunaCount < 2 && lane.entries.some(e => e.seq > (lane.summary?.covered ?? 0))) {
+      if (rt.summaryEnabled !== false && !rt.lunaBusy && Date.now() >= (rt.lunaRetryAt ?? 0) && this.lunaCount < 2 && lane.entries.some(e => e.seq > (lane.summary?.covered ?? 0))) {
         rt.lunaBusy = true; this.lunaCount++;
         void this.summarize(key, lane, rt).catch(() => { rt.lunaRetryAt = Date.now() + 60000; log.warn('intake', 'discuss-summary-failed', { key }); })
           .finally(() => { rt.lunaBusy = false; this.lunaCount--; });
@@ -285,6 +301,8 @@ export class Discuss {
   }
   private async summarize(key: string, lane: Lane, rt: Runtime): Promise<void> {
     const generation = lane.summaryGeneration ?? 0;
+    const policy = await this.policy(key, lane);
+    if (!policy.enabled) return;
     const pending = lane.entries.filter(e => e.seq > (lane.summary?.covered ?? 0) && e.batch !== undefined);
     const batch = pending.filter(e => e.batch === pending[0]?.batch).slice(0, 100);
     if (!batch.length) return;
@@ -296,7 +314,7 @@ export class Discuss {
         await this.bounded(rt, async signal => {
           if (!rt.luna) {
             const storageRoot = `${this.file}.aux/${createHash('sha256').update(key).digest('hex')}`;
-            rt.luna = await this.factory({ model: 'gpt-5.6-luna', effort: 'low', instructions: LUNA_PROMPT, storageRoot, resumeId: lane.lunaId }, signal);
+            rt.luna = await this.factory({ model: policy.model, fast: policy.fast, effort: 'low', instructions: LUNA_PROMPT, storageRoot, resumeId: lane.lunaId }, signal);
             lane.lunaId = rt.luna.sessionId;
             await this.save();
           }
@@ -316,7 +334,7 @@ export class Discuss {
             const rows = parsed[name];
             if (!Array.isArray(rows) || rows.length > 8 || rows.some(r => typeof r.text !== 'string' || r.text.length > 600 || !Array.isArray(r.messageIds) || !r.messageIds.length || r.messageIds.some(id => !known.has(id)))) throw new Error('Invalid summary references');
           }
-          signal.throwIfAborted(); if (this.closed || generation !== (lane.summaryGeneration ?? 0)) return;
+          signal.throwIfAborted(); if (this.closed || generation !== (lane.summaryGeneration ?? 0) || JSON.stringify(await this.policy(key, lane)) !== JSON.stringify(policy)) return;
           lane.summary = { version: (lane.summary?.version ?? 0) + 1, covered: batch.at(-1)!.seq, body: JSON.stringify(parsed), gaps: [...new Set([...(lane.summary?.gaps ?? []), ...gaps])] };
           await this.save();
         }); return;
@@ -353,7 +371,7 @@ export class Discuss {
             await rt.judge?.close(); rt.judge = replacement; rt.signature = snap.signature; rt.batches = rt.chars = 0;
           }
           const input = JSON.stringify({ hostId: snap.hostId, runId: snap.runId ?? null, busy: snap.busy,
-            summary: lane.summary?.body, recent: lane.entries.slice(-20).filter(e => !batch.includes(e)).map(e => ({ ...entryHistory(e), state: e.state })),
+            summary: rt.summaryEnabled === false ? undefined : lane.summary?.body, recent: lane.entries.slice(-20).filter(e => !batch.includes(e)).map(e => ({ ...entryHistory(e), state: e.state })),
             messages: batch.map(entryHistory) });
           let text = input, result: Judgment | undefined, bytes = 0;
           for (let query = 0; query <= 3; query++) {

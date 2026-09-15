@@ -104,6 +104,8 @@ export const DM = {
   // 🗜️ 自动压缩：项目级开关（同群设置里的那个，DM 里也能改），按钮携带项目名 n
   setAutoCompactDm: 'dm.proj.autoCompact',
   setContextBriefingDm: 'dm.proj.contextBriefing',
+  briefingModel: 'dm.proj.briefingModel',
+  briefingModelSubmit: 'dm.proj.briefingModel.submit',
   setDiscussDm: 'dm.proj.discuss',
   // 🤖 默认模型/强度：新话题的起始模型 + 推理强度（选完提交的下拉表单子卡，仿权限卡）
   modelDefault: 'dm.proj.modelDefault',
@@ -132,6 +134,8 @@ export const GS = {
   setNoMention: 'gs.noMention',
   setAutoCompact: 'gs.autoCompact',
   setContextBriefing: 'gs.contextBriefing',
+  briefingModel: 'gs.briefingModel',
+  briefingModelSubmit: 'gs.briefingModel.submit',
   setDiscuss: 'gs.discuss',
   // 🤖 默认模型/强度：群内 /settings 的镜像入口（open=进子卡，submit=保存，settings=返回群设置）
   settings: 'gs.settings',
@@ -1500,7 +1504,7 @@ export function buildCompletionReminderCustomCard(cfg: AppConfig): CardObject {
  * {@link buildSettingsCard}. Admin-gated by the handler.
  */
 export function buildGroupSettingsCard(
-  project: Pick<Project, 'name' | 'kind' | 'noMention' | 'origin' | 'autoCompact' | 'contextBriefing' | 'discuss' | 'backend' | 'defaultModel' | 'defaultEffort'>,
+  project: Pick<Project, 'name' | 'kind' | 'noMention' | 'origin' | 'autoCompact' | 'contextBriefing' | 'contextBriefingModel' | 'contextBriefingFast' | 'discuss' | 'backend' | 'defaultModel' | 'defaultEffort'>,
 ): CardObject {
   const kind = project.kind ?? 'multi';
   const noMention = project.noMention ?? defaultNoMention(project);
@@ -1532,6 +1536,8 @@ export function buildGroupSettingsCard(
         { label: '开', value: 'on' }, { label: '关', value: 'off' },
       ]),
       note('开启：使用消息总结模型整理消息；关闭：直接提供原文。'),
+      note(`消息总结模型：${project.contextBriefingModel ?? 'gpt-5.6-luna'} · Fast ${project.contextBriefingFast ? '开' : '关'}`),
+      actions([button('设置消息总结模型', { a: GS.briefingModel })]),
       hr(),
       md('🤖 默认模型 / 推理强度'),
       actions([button('设置默认模型', { a: GS.modelDefault }, 'primary')]),
@@ -1830,6 +1836,8 @@ export function buildProjectSettingsCard(
     | 'network'
     | 'autoCompact'
     | 'contextBriefing'
+    | 'contextBriefingModel'
+    | 'contextBriefingFast'
     | 'discuss'
     | 'backend'
     | 'defaultModel'
@@ -1885,6 +1893,8 @@ export function buildProjectSettingsCard(
         button('关', { a: DM.setContextBriefingDm, v: 'off', n: project.name }, project.contextBriefing === false ? 'primary' : 'default'),
       ]),
       note('开启：使用消息总结模型整理消息；关闭：直接提供原文。'),
+      note(`消息总结模型：${project.contextBriefingModel ?? 'gpt-5.6-luna'} · Fast ${project.contextBriefingFast ? '开' : '关'}`),
+      actions([button('设置消息总结模型', { a: DM.briefingModel, n: project.name })]),
       hr(),
       md('🤖 默认模型 / 推理强度'),
       actions([button('设置默认模型', { a: DM.modelDefault, n: project.name }, 'primary')]),
@@ -1969,4 +1979,21 @@ export function buildAddAllowedCard(
     ],
     { header: { title: '➕ 添加白名单成员', template: 'blue' } },
   );
+}
+
+/** Message-history model is independent of the replying model. */
+export function buildBriefingModelCard(p: Pick<Project, 'name' | 'contextBriefingModel' | 'contextBriefingFast'>, models: ModelInfo[], ctx: 'dm' | 'group', notice?: string): CardObject {
+  const selected = p.contextBriefingModel ?? 'gpt-5.6-luna';
+  const options = models.filter(m => !m.hidden).map(m => ({ label: m.displayName, value: m.id }));
+  if (!options.some(m => m.value === selected)) options.unshift({ label: selected, value: selected });
+  return card([
+    md(`**消息总结模型** · ${p.name}`), ...(notice ? [md(notice)] : []),
+    note('只影响消息简史。保存后下一次整理生效；已有摘要保留，主 Agent 模型不变。'),
+    form('briefing_model', [
+      selectMenu({ name: 'model', placeholder: '选择消息总结模型', options, initial: selected }),
+      selectMenu({ name: 'fast', placeholder: 'Fast', options: [{ label: 'Fast 关', value: 'off' }, { label: 'Fast 开', value: 'on' }], initial: p.contextBriefingFast ? 'on' : 'off' }),
+      actions([submitButton('保存', ctx === 'dm' ? { a: DM.briefingModelSubmit, n: p.name } : { a: GS.briefingModelSubmit }, 'primary', 'save_briefing')]),
+    ]),
+    actions([button('返回', ctx === 'dm' ? { a: DM.projectSettings, n: p.name } : { a: GS.settings })]),
+  ], { header: { title: '消息总结模型', template: 'blue' } });
 }

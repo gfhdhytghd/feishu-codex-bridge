@@ -2362,6 +2362,20 @@ ${UI_PURE_JS}
     d.appendChild(el('div', 'note', '开启时使用所选模型整理消息；关闭时直接提供原文。'));
     d.appendChild(el('hr', 'hr'));
 
+    var historyModelRow = el('div', 'statline');
+    historyModelRow.appendChild(el('span', null, '消息总结模型'));
+    var historyModel = el('input', 'compact-input');
+    historyModel.value = p.contextBriefingModel || 'gpt-5.6-luna';
+    historyModel.setAttribute('aria-label', '消息总结模型 ID');
+    historyModelRow.appendChild(historyModel);
+    var saveHistoryModel = el('button', 'btn primary sm', '保存模型');
+    saveHistoryModel.onclick = function () { postWrite('/api/project/' + encodeURIComponent(p.name) + '/context-briefing', { model: historyModel.value.trim() }); };
+    historyModelRow.appendChild(saveHistoryModel); d.appendChild(historyModelRow);
+    d.appendChild(el('div', null, '简史 Fast'));
+    d.appendChild(optButtons([{ label: '开', value: 'on' }, { label: '关', value: 'off' }], p.contextBriefingFast ? 'on' : 'off',
+      function (v) { postWrite('/api/project/' + encodeURIComponent(p.name) + '/context-briefing', { fast: v === 'on' }); }));
+    d.appendChild(el('hr', 'hr'));
+
     if (p.kind === 'single' && (!p.backend || p.backend === 'codex-appserver')) {
       d.appendChild(el('div', null, 'Discuss · 群聊参与判断'));
       d.appendChild(optButtons([{ label: '开', value: 'on' }, { label: '关', value: 'off' }], p.discuss ? 'on' : 'off',

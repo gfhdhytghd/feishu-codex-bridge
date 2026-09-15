@@ -179,3 +179,33 @@ it('rechecks uncertain delivery after 30 seconds despite intermediate ticks', as
     expect(t.hooks.reconcile).toHaveBeenCalledTimes(2);
   } finally { clock.mockRestore(); }
 });
+
+it('configures summary independently of judgment and switches model and Fast', async () => {
+  const t = setup('IGNORE');
+  let policy = { enabled: false, model: 'gpt-5.6-sol', fast: true };
+  Object.assign(t.hooks, { summaryPolicy: async () => policy });
+  await t.worker.observe('key', msg('a'), false);
+  await wait(async () => expect((await state()).lanes.key.entries[0].state).toBe('ignored'));
+  expect(t.factory.mock.calls.some(([o]) => o.instructions === LUNA_PROMPT)).toBe(false);
+  policy = { ...policy, enabled: true }; await t.worker.tick();
+  await wait(async () => expect((await state()).lanes.key.summary.version).toBe(1));
+  expect(t.factory).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-5.6-sol', fast: true, instructions: LUNA_PROMPT }), expect.any(AbortSignal));
+  const original = t.asks.find(a => a.model === 'gpt-5.6-sol')!;
+  policy = { enabled: true, model: 'gpt-6-astra', fast: false };
+  await t.worker.observe('key', msg('b'), false);
+  await wait(() => expect(t.factory).toHaveBeenCalledWith(expect.objectContaining({ model: 'gpt-6-astra', fast: false, instructions: LUNA_PROMPT }), expect.any(AbortSignal)));
+  expect(original.close).toHaveBeenCalled();
+  policy = { ...policy, enabled: false };
+  const context = await t.worker.context('key', 'host');
+  expect(context.block).not.toContain('简报 v'); expect(context.block).toContain('"messageId":"a"');
+});
+it('does not commit a summary finishing after the project turns it off', async () => {
+  let release!: (v: string) => void;
+  const t = setup('IGNORE', { ...snap }, { luna: () => new Promise(r => { release = r; }) });
+  let enabled = true; Object.assign(t.hooks, { summaryPolicy: async () => ({ enabled, model: 'gpt-5.6-luna', fast: false }) });
+  await t.worker.observe('key', msg('a'), false);
+  await wait(() => expect(release).toBeTypeOf('function'));
+  enabled = false; release(JSON.stringify(emptySummary));
+  await new Promise(resolve => setTimeout(resolve, 100));
+  expect((await state()).lanes.key.summary).toBeUndefined();
+});

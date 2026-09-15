@@ -513,8 +513,10 @@ export function createWebServer(opts: WebServerOptions): WebServer {
           if (typeof body.on !== 'boolean') { sendJson(res, 400, { error: 'bad_body', message: 'on 必须是布尔值' }); return; }
           await opts.service.setDiscuss(botId, project, body.on);
         } else if (action === 'context-briefing') {
-          if (typeof body.on !== 'boolean') { sendJson(res, 400, { error: 'bad_body', message: 'on 必须是布尔值' }); return; }
-          await opts.service.setContextBriefing(botId, project, body.on);
+          if ((body.on !== undefined && typeof body.on !== 'boolean') || (body.fast !== undefined && typeof body.fast !== 'boolean') || (body.model !== undefined && typeof body.model !== 'string') || (body.on === undefined && body.model === undefined && body.fast === undefined)) {
+            sendJson(res, 400, { error: 'bad_body', message: '请提供有效的消息简史开关、模型或 Fast 设置' }); return;
+          }
+          await opts.service.setContextBriefing(botId, project, body.on as boolean | undefined, { model: body.model as string | undefined, fast: body.fast as boolean | undefined });
         } else {
           await opts.service.setAutoCompact(botId, project, body.on === true);
         }

@@ -8,7 +8,7 @@ import type { ReasoningEffort } from '../types';
 import type { BriefingModel } from './briefing-runner';
 
 export interface DiscussModelOptions {
-  storageRoot?: string; resumeId?: string;
+  storageRoot?: string; resumeId?: string; fast?: boolean;
   model: string; effort: ReasoningEffort; instructions: string;
   sourceId?: string; sourcePath?: string; lastTurnId?: string; beforeTurnId?: string;
 }
@@ -75,7 +75,7 @@ export async function createDiscussModel(opts: DiscussModelOptions, signal: Abor
     await client.connect();
     signal.throwIfAborted();
     const common = { cwd, model: opts.model, approvalPolicy: 'never', sandbox: 'read-only', ephemeral: !opts.storageRoot,
-      config: AUX_CONFIG, developerInstructions: opts.instructions };
+      config: AUX_CONFIG, ...(opts.fast === undefined ? {} : { serviceTier: opts.fast ? 'fast' : null }), developerInstructions: opts.instructions };
     let resumed: { thread: { id: string } } | undefined;
     if (opts.storageRoot && opts.resumeId) {
       resumed = await client.request<{ thread: { id: string } }>('thread/resume', {
@@ -99,7 +99,7 @@ export async function createDiscussModel(opts: DiscussModelOptions, signal: Abor
           const boundary = first ? '上下文边界：继承历史仅供参考，不继续其中任务或审批。仅处理本边界后的分类/摘要请求。禁止执行任务、发消息、修改文件或委派。\n' : '';
           first = false;
           const { turn } = await client!.request<{ turn: { id: string } }>('turn/start', {
-            threadId, model: opts.model, effort: opts.effort,
+            threadId, model: opts.model, effort: opts.effort, ...(opts.fast === undefined ? {} : { serviceTier: opts.fast ? 'fast' : null }),
             input: [{ type: 'text', text: boundary + input, text_elements: [] }], outputSchema: schema,
           });
           let text = '';

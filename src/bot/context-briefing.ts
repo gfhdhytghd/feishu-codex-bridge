@@ -105,7 +105,7 @@ export class ContextBriefing {
   }
 
   async prepare(msg: NormalizedMessage, key: string, signal: AbortSignal,
-    baseline?: { sessionId?: string; lastSeenAt?: number }, projectEnabled = true): Promise<PreparedContext> {
+    baseline?: { sessionId?: string; lastSeenAt?: number }, projectEnabled = true, policy?: { enabled?: boolean; model?: string; fast?: boolean }): Promise<PreparedContext> {
     await this.loaded;
     if (this.closed) throw new Error('Briefing coordinator closed');
     signal.throwIfAborted();
@@ -153,12 +153,12 @@ export class ContextBriefing {
       const rest = messages.filter(m => !priorityIds.has(m.messageId)).slice(-(99 - topic.length));
       messages = mergeHistory([...rest, ...topic, inboundHistory(msg)], request, 100);
       if (stats.enabled && delta.length > 100) gaps.push(`新增 ${delta.length} 条消息，初始简报取最近消息及本话题共 100 条`);
-      if (stats.enabled && this.config.enabled !== false && projectEnabled) {
+      if (stats.enabled && (policy?.enabled ?? this.config.enabled !== false) && projectEnabled) {
         if (this.runningModels >= 2) { gaps.push('Luna 并发繁忙，直接提供原文'); mode = 'busy-fallback'; }
         else {
           this.runningModels++;
           try {
-            model = await bounded(this.modelFactory(this.config.model || 'gpt-5.6-luna', controller.signal));
+            model = await bounded(this.modelFactory(policy?.model || this.config.model || 'gpt-5.6-luna', controller.signal, policy?.fast ?? false));
             let extra = 0;
             for (;;) {
               const input = { question: inboundHistory(msg), currentThreadId: msg.threadId, gaps,

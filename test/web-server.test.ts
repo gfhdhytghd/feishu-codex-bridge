@@ -432,6 +432,7 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
     svc.setNoMention = async () => {
       throw new AdminWriteError('项目「demo」不存在');
     };
+    svc.setContextBriefing = async (botId, project, on, settings) => { written.push({ botId, project, on, ...settings }); };
     svc.setCompletionReminder = async (botId, value) => {
       written.push({ botId, completionReminder: value });
     };
@@ -442,6 +443,17 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
 
   afterAll(async () => {
     await writeWeb.close();
+  });
+
+  it('accepts model-only and Fast-only history settings without changing its switch', async () => {
+    for (const body of [{ model: 'gpt-5.6-sol' }, { fast: true }]) {
+      const res = await fetch(`${writeBase}/api/project/demo/context-briefing?bot=cli_a`, {
+        method: 'POST', headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      expect(res.status).toBe(200);
+      expect(written.at(-1)).toMatchObject({ botId: 'cli_a', project: 'demo', on: undefined, ...body });
+    }
+    written.length = 0;
   });
 
   it('写成功 → 200 {ok:true}（前端走 ✅ 已保存）', async () => {

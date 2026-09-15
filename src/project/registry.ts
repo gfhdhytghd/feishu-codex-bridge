@@ -52,6 +52,8 @@ export interface Project {
   autoCompact?: boolean;
   /** Conditional Luna briefing; off keeps raw new-message context. Default on. */
   contextBriefing?: boolean;
+  contextBriefingModel?: string;
+  contextBriefingFast?: boolean;
   /** Fork-based group participation, single Codex sessions only; default off. */
   discuss?: boolean;
   /** agent backend id for this project (see src/agent/index.ts registry).

@@ -17,7 +17,7 @@ export const BRIEFING_INSTRUCTIONS = `你是主模型 Astra 的群聊上下文�
 
 /** A fresh Codex home excludes user plugins, MCP servers, skills and memory.
  * Only the existing login file is linked, never copied or printed. */
-export async function createBriefingModel(model: string, signal: AbortSignal): Promise<BriefingModel> {
+export async function createBriefingModel(model: string, signal: AbortSignal, fast = false): Promise<BriefingModel> {
   signal.throwIfAborted();
   const bin = resolveCodexBin();
   if (!bin) throw new Error('Codex binary unavailable');
@@ -39,7 +39,7 @@ export async function createBriefingModel(model: string, signal: AbortSignal): P
     await client.connect();
     signal.throwIfAborted();
     const started = await client.request<{ thread: { id: string } }>('thread/start', {
-      cwd, model, approvalPolicy: 'never', sandbox: 'read-only', ephemeral: true,
+      cwd, model, serviceTier: fast ? 'fast' : null, approvalPolicy: 'never', sandbox: 'read-only', ephemeral: true,
       baseInstructions: BRIEFING_INSTRUCTIONS,
       config: { web_search: 'disabled', project_doc_max_bytes: 0,
         'features.shell_tool': false, 'features.unified_exec': false, 'features.code_mode': false,
@@ -56,7 +56,7 @@ export async function createBriefingModel(model: string, signal: AbortSignal): P
       async ask(input, schema, turnSignal) {
         turnSignal.throwIfAborted();
         const result = await client!.request<{ turn: { id: string } }>('turn/start', {
-          threadId, model, effort: 'low', input: [{ type: 'text', text: input, text_elements: [] }], outputSchema: schema,
+          threadId, model, serviceTier: fast ? 'fast' : null, effort: 'low', input: [{ type: 'text', text: input, text_elements: [] }], outputSchema: schema,
         });
         const turnId = result.turn.id;
         let text = '';
