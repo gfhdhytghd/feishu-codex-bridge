@@ -68,7 +68,7 @@ import {
   type PendingPolicy,
   type SessionTitleBackendConfig,
 } from '../config/schema';
-import { weaveMemoryContext } from './context-format';
+import { loadMemoryContext, startMemorySync, weaveMemoryContext } from './memory-context';
 import { Discuss, type DiscussSnapshot } from './discuss';
 import { ContextBriefing, type ContextReceipt } from './context-briefing';
 import { ChatHistory } from './briefing-history';
@@ -668,6 +668,7 @@ export function createOrchestrator(
   fallbackCwd: string,
   cliBridge?: CliBridgeRuntimeHooks,
 ): Orchestrator {
+  startMemorySync(cfg);
   const contextConfig = cfg.preferences?.contextBriefing;
   let briefings = contextConfig ? new ContextBriefing(
     new ChatHistory(channel, contextConfig.archivePath, contextConfig.pythonCommand), contextConfig,
@@ -1424,6 +1425,17 @@ export function createOrchestrator(
       const quoted = await fetchQuotedMessage(channel, msg.replyToMessageId);
       body = weaveQuote(body, quoted);
     }
+    const memory = await loadMemoryContext(cfg, {
+      chat_id: msg.chatId,
+      message_id: msg.messageId,
+      thread_id: msg.threadId,
+      sender_id: msg.senderId,
+      sender_name: msg.senderName,
+      create_time: msg.createTime,
+      msg_type: msg.rawContentType,
+      query: text,
+    });
+    body = weaveMemoryContext(body, memory);
     // Identity weave (outermost within ingestContext): fold WHO sent this turn so
     // codex can match the roster (approve-gate) and @ them back. Covers both the
     // first-turn (startReservedRun) and mid-turn (handleTurn) paths.
