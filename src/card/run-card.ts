@@ -95,6 +95,8 @@ export interface RunCardState {
   requesterOpenId?: string;
   /** drop tool blocks from the render (pref) */
   showTools?: boolean;
+  /** Keep tool details available but never expand them automatically. */
+  collapseTools?: boolean;
   /** model id for the bottom-right「模型 · 推理强度」footnote (e.g. 'gpt-5.5'); set
    * when 模型显示 is running OR always. Absent ⇒ no footnote (default / off). */
   model?: string;
@@ -179,7 +181,7 @@ function renderRunning(state: RunState, rc: RunCardState): CardElement[] {
       textParts.push(b.content);
     }
   }
-  if (tools.length > 0) elements.push(...renderToolGroup(tools, false));
+  if (tools.length > 0) elements.push(...renderToolGroup(tools, false, false, rc.collapseTools === true));
 
   // Single streamed answer element. Only emitted once there's text, so its first
   // appearance is one whole-card update that establishes the element; subsequent
@@ -477,7 +479,7 @@ function* groupBlocks(blocks: Block[]): Generator<Group> {
   if (toolBuf.length > 0) yield { kind: 'tools', tools: toolBuf };
 }
 
-function renderToolGroup(tools: ToolEntry[], finalized: boolean, compact = false): CardElement[] {
+function renderToolGroup(tools: ToolEntry[], finalized: boolean, compact = false, collapseTools = false): CardElement[] {
   if (tools.length === 0) return [];
   // compact (process-panel over size/component budget): one summary panel that
   // still lists each tool's FULL command, just without output bodies.
@@ -495,7 +497,7 @@ function renderToolGroup(tools: ToolEntry[], finalized: boolean, compact = false
   const latest = tools[tools.length - 1];
   const out: CardElement[] = [];
   if (prior.length > 0) out.push(collapsedToolSummary(prior, false));
-  if (latest) out.push(toolPanel(latest, true));
+  if (latest) out.push(toolPanel(latest, !collapseTools));
   return out;
 }
 

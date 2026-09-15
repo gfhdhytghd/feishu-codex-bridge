@@ -1,3 +1,5 @@
+import { messageHasVoice, transcribeVoice, VoiceError } from './voice';
+import { VoiceIntake } from './voice-intake';
 import type {
   BotAddedEvent,
   CardActionEvent,
@@ -40,6 +42,7 @@ import {
   getSessionTitleConfig,
   getSessionTitleEfforts,
   getShowToolCalls,
+  getCollapseToolCalls,
   getCommentsConfig,
   getCompletionReminderConfig,
   shouldShowCompletionReminderButton,
@@ -648,6 +651,24 @@ export function createOrchestrator(
   fallbackCwd: string,
   cliBridge?: CliBridgeRuntimeHooks,
 ): Orchestrator {
+  const voiceShutdown = new AbortController();
+  const voiceIntake = new VoiceIntake();
+  const voiceQueued = new WeakSet<NormalizedMessage>();
+  const voiceTexts = new WeakMap<NormalizedMessage, Promise<string>>();
+  function voiceText(msg: NormalizedMessage, signal?: AbortSignal): Promise<string> {
+    let pending = voiceTexts.get(msg);
+    if (!pending) {
+      pending = transcribeVoice(channel, msg, signal ? AbortSignal.any([signal, voiceShutdown.signal]) : voiceShutdown.signal).then(text => { msg.content = text; return text; });
+      voiceTexts.set(msg, pending);
+    }
+    return pending;
+  }
+  function voiceFailed(msg: NormalizedMessage, flat: boolean, err: unknown): void {
+    const detail = err instanceof VoiceError ? err.message : '语音处理失败，请重发或改发文字';
+    log.warn('intake', 'voice-failed', { msgId: msg.messageId, detail });
+    void channel.send(msg.chatId, { markdown: `❌ ${detail}。本条语音未提交给模型。` },
+      { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
+  }
   /** Lazily-constructed backends by id — one instance per backend for the whole
    * bridge (mirrors the old single-instance shape; codex stays the default). */
   const backends = new Map<string, AgentBackend>();
@@ -1199,9 +1220,15 @@ export function createOrchestrator(
    */
   async function ingestContext(msg: NormalizedMessage, text: string): Promise<string> {
     let body = text;
+    if (messageHasVoice(msg)) {
+      const transcript = await voiceText(msg);
+      body = text.includes(transcript) ? text
+        : /<audio\b[^>]*\/>|\[audio\]/i.test(text)
+          ? text.replace(/<audio\b[^>]*\/>|\[audio\]/gi, () => transcript) : transcript;
+    }
     if (messageHasFiles(msg)) {
       const files = await collectInboundFiles(channel, msg);
-      body = weaveFileManifest(text, files);
+      body = weaveFileManifest(body, files);
       // A file-ONLY message whose download failed (oversize / Feishu reject /
       // transient) strips to '' — don't hand codex a blank turn (wasted run +
       // empty card). Tell it the attachment couldn't be read so it can say so.
@@ -1233,7 +1260,24 @@ export function createOrchestrator(
     flat: boolean,
     project: Project | undefined,
     perm: TurnPerm,
+    voicePrepared = false,
   ): Promise<void> {
+    // Reserve an ordered preparation lane before starting ASR. Later messages
+    // in this session wait behind it; other topics and card actions stay free.
+    if (!voicePrepared && (messageHasVoice(msg) || voiceIntake.hasPending(sessionKey))) {
+      if (active.get(sessionKey)?.isGoal) { await replyGoalBusy(msg, flat); return; }
+      voiceQueued.add(msg);
+      voiceIntake.submit(sessionKey, async signal => {
+        const body = messageHasVoice(msg) ? await voiceText(msg, signal) : text;
+        signal.throwIfAborted();
+        return { body, signal };
+      }, async ({ body, signal }) => {
+        if (signal.aborted) return;
+        await handleTurn(msg, body, sessionKey, flat, project, perm, true);
+      }, err => voiceFailed(msg, flat, err));
+      return;
+    }
+
     // Capture title material before ingestContext adds sender/quote/file blocks.
     const titleSource = sessionTitleSourceFromMessage(msg, text);
     // Mid-turn: steer (引导) or queue (排队).
@@ -1265,7 +1309,7 @@ export function createOrchestrator(
         await replyGoalBusy(msg, flat);
         return;
       }
-      if (getPendingPolicy(cfg) === 'steer' && cur.run && cur.thread) {
+      if (cur.queue.length === 0 && !voiceQueued.has(msg) && !messageHasVoice(msg) && getPendingPolicy(cfg) === 'steer' && cur.run && cur.thread) {
         const tid = cur.run.turnId();
         if (tid) {
           try {
@@ -3130,6 +3174,10 @@ export function createOrchestrator(
     .on(DM.setTools, ({ evt, value }) => {
       applyPref(evt, (p) => (p.showToolCalls = value.v === 'on'));
     })
+    .on(DM.setCollapseTools, ({ evt, value }) => {
+      if (value.v !== 'on' && value.v !== 'off') return;
+      applyPref(evt, (p) => (p.collapseToolCalls = value.v === 'on'));
+    })
     .on(DM.setShowModel, ({ evt, value }) => {
       applyPref(evt, (p) => {
         p.showModel = value.v === 'running' ? 'running' : value.v === 'always' ? 'always' : 'off';
@@ -4150,6 +4198,7 @@ export function createOrchestrator(
           rs: render.snapshot(),
           requesterOpenId: currentTurn.requesterOpenId,
           showTools: render.showTools,
+          collapseTools: getCollapseToolCalls(cfg),
           completionReminder: completionReminderView(state),
           // 模型显示档位：footnote 本轮 model·推理强度；always 档终态卡也保留。
           ...(modelDisp !== 'off' && turnModel
@@ -4652,6 +4701,7 @@ export function createOrchestrator(
         rs: render.snapshot(),
         requesterOpenId: opts.requesterOpenId,
         showTools: render.showTools,
+        collapseTools: getCollapseToolCalls(cfg),
         goalControls: true,
         ...(goalModelDisp !== 'off' && opts.model
           ? { model: opts.model, effort: opts.effort, modelOnTerminal: goalModelDisp === 'always' }
@@ -5358,6 +5408,8 @@ export function createOrchestrator(
 
   async function shutdown(): Promise<void> {
     clearInterval(reaper);
+    voiceShutdown.abort();
+    voiceIntake.close();
     await sessionTitles.shutdown();
     // adopt 失败的孤儿线程已在 launchRun/launchGoalRun 的 finally 就地 close，
     // 这里只需回收 LIVE 会话缓存。

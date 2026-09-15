@@ -8,6 +8,7 @@ import {
   getSessionTitleConfig,
   getSessionTitleEfforts,
   getShowToolCalls,
+  getCollapseToolCalls,
   resolveOwner,
   RUN_IDLE_TIMEOUT_MAX_SEC,
   RUN_IDLE_TIMEOUT_MIN_SEC,
@@ -74,6 +75,7 @@ export const DM = {
   rmDo: 'dm.rmDo',
   rmCancel: 'dm.rmCancel',
   setTools: 'dm.set.tools',
+  setCollapseTools: 'dm.set.collapseTools',
   setShowModel: 'dm.set.showModel',
   setWatchdog: 'dm.set.watchdog',
   // 假死超时「自定义…」：watchdogCustom 打开输入卡，watchdogCustomSubmit 保存任意秒数
@@ -914,6 +916,16 @@ export function buildSettingsCard(cfg: AppConfig): CardObject {
         [
           { label: '显示', value: 'on' },
           { label: '隐藏', value: 'off' },
+        ],
+      ),
+      ...settingItem(
+        '🔧 工具调用默认收起',
+        '开启后，最新工具调用也不自动展开；仍可点击查看详情。工具调用隐藏时此项不生效。',
+        DM.setCollapseTools,
+        getCollapseToolCalls(cfg) ? 'on' : 'off',
+        [
+          { label: '开启', value: 'on' },
+          { label: '关闭', value: 'off' },
         ],
       ),
       ...settingItem(

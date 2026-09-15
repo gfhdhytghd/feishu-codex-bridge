@@ -98,6 +98,8 @@ export interface AppPreferences {
   messageReply?: MessageReplyMode;
   /** render tool-call blocks in output. Default true. */
   showToolCalls?: boolean;
+  /** Keep tool panels collapsed by default, including the latest live call. Default false. */
+  collapseToolCalls?: boolean;
   /** 「模型 · 推理强度」脚注的显示档位（运行卡右下角）。off/running/always，
    * 默认 running（仅输出时显示，生成完即收起）——平时能扫一眼当前模型，又不在终态
    * 卡上长期留标签。兼容历史布尔值：true→always、false→off（见 {@link getModelDisplay}）。 */
@@ -202,6 +204,10 @@ export function getMessageReplyMode(cfg: AppConfig): MessageReplyMode {
   const raw = cfg.preferences?.messageReply;
   if (raw === 'card' || raw === 'markdown' || raw === 'text') return raw;
   return 'card';
+}
+
+export function getCollapseToolCalls(cfg: AppConfig): boolean {
+  return cfg.preferences?.collapseToolCalls === true;
 }
 
 export function getShowToolCalls(cfg: AppConfig): boolean {

@@ -428,3 +428,23 @@ describe('模型 · 推理强度 footnote（模型显示三档）', () => {
     expect(json).not.toContain('undefined');
   });
 });
+
+describe('tool default collapse preference', () => {
+  const live = () => run([1, 2, 3].map((n) => ({ type: 'tool_use' as const, itemId: `t${n}`, title: `command-${n}` })));
+  it('keeps the latest live call collapsed while retaining its details', () => {
+    const card = buildRunCard({ rs: live(), collapseTools: true });
+    const panels = bodyEls(card).filter((el) => el.tag === 'collapsible_panel');
+    expect(panels.length).toBeGreaterThan(0);
+    expect(panels.every((el) => el.expanded === false)).toBe(true);
+    expect(JSON.stringify(card)).toContain('command-3');
+  });
+  it('preserves automatic expansion when the preference is absent or off', () => {
+    for (const collapseTools of [undefined, false]) {
+      const panels = bodyEls(buildRunCard({ rs: live(), collapseTools })).filter((el) => el.tag === 'collapsible_panel');
+      expect(panels.some((el) => el.expanded === true)).toBe(true);
+    }
+  });
+  it('continues to hide tools when display is disabled', () => {
+    expect(JSON.stringify(buildRunCard({ rs: live(), collapseTools: true, showTools: false }))).not.toContain('command-3');
+  });
+});
