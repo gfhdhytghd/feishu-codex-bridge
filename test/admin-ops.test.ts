@@ -10,6 +10,7 @@ import {
   performSetAutoCompact,
   performSetModelDefault,
   performSetContextBriefing,
+  performSetDiscuss,
   performSetCompletionReminder,
   performSetNoMention,
   performSetPermissionMode,
@@ -104,6 +105,17 @@ beforeEach(async () => {
 });
 
 describe('共享层契约：DM（handle-message re-export）与 ops 是同一个函数对象', () => {
+  it('Discuss is opt-in, only single Codex groups, and preserves noMention', async () => {
+    expect((await getProjectByName('demo'))?.discuss).toBeUndefined();
+    expect((await performSetDiscuss({ projectName: 'demo', on: true })).ok).toBe(false);
+    await updateProject('demo', { kind: 'single', noMention: false });
+    expect((await performSetDiscuss({ projectName: 'demo', on: true })).ok).toBe(true);
+    expect((await getProjectByName('demo'))?.noMention).toBe(false);
+    expect((await performSetDiscuss({ projectName: 'demo', on: false })).ok).toBe(true);
+    expect((await getProjectByName('demo'))?.noMention).toBe(false);
+    expect((await performSetDiscuss({ projectName: 'demo', on: 'yes' as never })).ok).toBe(false);
+  });
+
   it('persists the project context switch without evicting sessions or modifying other fields', async () => {
     const before = await getProjectByName('demo');
     const evict = vi.fn(async () => undefined);

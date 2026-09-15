@@ -104,6 +104,7 @@ export const DM = {
   // 🗜️ 自动压缩：项目级开关（同群设置里的那个，DM 里也能改），按钮携带项目名 n
   setAutoCompactDm: 'dm.proj.autoCompact',
   setContextBriefingDm: 'dm.proj.contextBriefing',
+  setDiscussDm: 'dm.proj.discuss',
   // 🤖 默认模型/强度：新话题的起始模型 + 推理强度（选完提交的下拉表单子卡，仿权限卡）
   modelDefault: 'dm.proj.modelDefault',
   modelDefaultSubmit: 'dm.proj.modelDefault.submit',
@@ -131,6 +132,7 @@ export const GS = {
   setNoMention: 'gs.noMention',
   setAutoCompact: 'gs.autoCompact',
   setContextBriefing: 'gs.contextBriefing',
+  setDiscuss: 'gs.discuss',
   // 🤖 默认模型/强度：群内 /settings 的镜像入口（open=进子卡，submit=保存，settings=返回群设置）
   settings: 'gs.settings',
   modelDefault: 'gs.modelDefault',
@@ -1498,7 +1500,7 @@ export function buildCompletionReminderCustomCard(cfg: AppConfig): CardObject {
  * {@link buildSettingsCard}. Admin-gated by the handler.
  */
 export function buildGroupSettingsCard(
-  project: Pick<Project, 'name' | 'kind' | 'noMention' | 'origin' | 'autoCompact' | 'contextBriefing' | 'backend' | 'defaultModel' | 'defaultEffort'>,
+  project: Pick<Project, 'name' | 'kind' | 'noMention' | 'origin' | 'autoCompact' | 'contextBriefing' | 'discuss' | 'backend' | 'defaultModel' | 'defaultEffort'>,
 ): CardObject {
   const kind = project.kind ?? 'multi';
   const noMention = project.noMention ?? defaultNoMention(project);
@@ -1522,6 +1524,10 @@ export function buildGroupSettingsCard(
         { label: '关', value: 'off' },
       ]),
       note('开启后：上下文接近上限时 Codex 自动总结早前对话、释放空间（默认开）。改动下一轮会话生效。'),
+      ...(kind === 'single' && (!project.backend || project.backend === 'codex-appserver') ? [
+        ...optionRow('Discuss · 群聊参与判断', GS.setDiscuss, project.discuss ? 'on' : 'off', [{ label: '开', value: 'on' }, { label: '关', value: 'off' }]),
+        note('普通消息先判断，@直接处理。消息简史可在下方独立设置。'),
+      ] : []),
       ...optionRow('🧠 消息简史', GS.setContextBriefing, project.contextBriefing !== false ? 'on' : 'off', [
         { label: '开', value: 'on' }, { label: '关', value: 'off' },
       ]),
@@ -1824,7 +1830,7 @@ export function buildProjectSettingsCard(
     | 'network'
     | 'autoCompact'
     | 'contextBriefing'
-
+    | 'discuss'
     | 'backend'
     | 'defaultModel'
     | 'defaultEffort'
@@ -1868,6 +1874,11 @@ export function buildProjectSettingsCard(
       ]),
       note('开启后：上下文接近上限时 Codex 自动总结早前对话、释放空间（默认开）。改动下一轮会话生效。'),
       hr(),
+      ...(kind === 'single' && (!project.backend || project.backend === 'codex-appserver') ? [
+        md('Discuss · 群聊参与判断'),
+        actions([button('开', { a: DM.setDiscussDm, v: 'on', n: project.name }, project.discuss ? 'primary' : 'default'), button('关', { a: DM.setDiscussDm, v: 'off', n: project.name }, project.discuss ? 'default' : 'primary')]),
+        note('普通消息先判断，@直接处理。消息简史可在下方独立设置。'),
+      ] : []),
       md('🧠 消息简史'),
       actions([
         button('开', { a: DM.setContextBriefingDm, v: 'on', n: project.name }, project.contextBriefing !== false ? 'primary' : 'default'),

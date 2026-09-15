@@ -48,6 +48,7 @@ export type AdminWriteOp =
   | { kind: 'setNoMention'; project: string; on: boolean }
   | { kind: 'setAutoCompact'; project: string; on: boolean }
   | { kind: 'setContextBriefing'; project: string; on: boolean }
+  | { kind: 'setDiscuss'; project: string; on: boolean }
   | {
       kind: 'setCompletionReminder';
       mode: CompletionReminderMode;
@@ -271,6 +272,15 @@ export async function performSetNoMention(opts: { projectName: string; on: boole
   return { ok: true, project: await freshOr(opts.projectName, { ...p, noMention: opts.on }) };
 }
 
+export async function performSetDiscuss(opts: { projectName: string; on: boolean }): Promise<AdminWriteOutcome> {
+  if (typeof opts.on !== 'boolean') return { ok: false, reason: 'Discuss 开关必须是布尔值' };
+  const p = await getProjectByName(opts.projectName);
+  if (!p) return { ok: false, reason: '项目不存在' };
+  if (opts.on && (p.kind !== 'single' || (p.backend && p.backend !== 'codex-appserver'))) return { ok: false, reason: 'Discuss 仅支持 Codex 单会话群' };
+  await updateProject(opts.projectName, { discuss: opts.on });
+  return { ok: true, project: await freshOr(opts.projectName, { ...p, discuss: opts.on }) };
+}
+
 /** Per-project briefing policy, read at intake; never interrupts a live turn. */
 export async function performSetContextBriefing(opts: { projectName: string; on: boolean }): Promise<AdminWriteOutcome> {
   if (typeof opts.on !== 'boolean') return { ok: false, reason: '上下文策略开关必须是布尔值' };
@@ -398,6 +408,8 @@ export async function runAdminWriteOp(
       });
     case 'setNoMention':
       return performSetNoMention({ projectName: op.project, on: op.on });
+    case 'setDiscuss':
+      return performSetDiscuss({ projectName: op.project, on: op.on });
     case 'setContextBriefing':
       return performSetContextBriefing({ projectName: op.project, on: op.on });
     case 'setAutoCompact':

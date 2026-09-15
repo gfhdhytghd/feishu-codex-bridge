@@ -2362,6 +2362,13 @@ ${UI_PURE_JS}
     d.appendChild(el('div', 'note', '开启时使用所选模型整理消息；关闭时直接提供原文。'));
     d.appendChild(el('hr', 'hr'));
 
+    if (p.kind === 'single' && (!p.backend || p.backend === 'codex-appserver')) {
+      d.appendChild(el('div', null, 'Discuss · 群聊参与判断'));
+      d.appendChild(optButtons([{ label: '开', value: 'on' }, { label: '关', value: 'off' }], p.discuss ? 'on' : 'off',
+        function (v) { postWrite('/api/project/' + encodeURIComponent(p.name) + '/discuss', { on: v === 'on' }); }));
+      d.appendChild(el('div', 'note', '普通群消息先判断是否回复或引导当前任务；@直接处理。消息简史独立设置，关闭判断后恢复原免@设置。'));
+      d.appendChild(el('hr', 'hr'));
+    }
     // 🧵 话题
     d.appendChild(el('div', null, '🧵 话题 · 共 ' + p.sessionCount + ' 个'));
     var topicBox = el('div', 'note', '加载中…');

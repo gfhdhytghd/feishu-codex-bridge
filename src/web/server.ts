@@ -482,7 +482,7 @@ export function createWebServer(opts: WebServerOptions): WebServer {
 
     // POST 写操作 —— daemon 进程内为真实写入（共享 admin/ops.ts，与 DM 卡片同
     // 源）；只读预览进程映射 501（NotWiredYetError），校验拒绝映射 409。
-    const writeMatch = /^\/api\/project\/([^/]+)\/(backend|permission|no-mention|auto-compact|context-briefing)$/.exec(pathName);
+    const writeMatch = /^\/api\/project\/([^/]+)\/(backend|permission|no-mention|auto-compact|context-briefing|discuss)$/.exec(pathName);
     if (req.method === 'POST' && writeMatch) {
       const project = decodeURIComponent(writeMatch[1]!);
       const action = writeMatch[2]!;
@@ -509,6 +509,9 @@ export function createWebServer(opts: WebServerOptions): WebServer {
           });
         } else if (action === 'no-mention') {
           await opts.service.setNoMention(botId, project, body.on === true);
+        } else if (action === 'discuss') {
+          if (typeof body.on !== 'boolean') { sendJson(res, 400, { error: 'bad_body', message: 'on 必须是布尔值' }); return; }
+          await opts.service.setDiscuss(botId, project, body.on);
         } else if (action === 'context-briefing') {
           if (typeof body.on !== 'boolean') { sendJson(res, 400, { error: 'bad_body', message: 'on 必须是布尔值' }); return; }
           await opts.service.setContextBriefing(botId, project, body.on);

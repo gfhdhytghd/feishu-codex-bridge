@@ -28,6 +28,7 @@ import {
   performBackendSwitch,
   performSetAutoCompact,
   performSetContextBriefing,
+  performSetDiscuss,
   performSetCompletionReminder,
   performSetModelDefault,
   performSetNoMention,
@@ -68,6 +69,7 @@ import {
   type SessionTitleBackendConfig,
 } from '../config/schema';
 import { weaveMemoryContext } from './context-format';
+import { Discuss, type DiscussSnapshot } from './discuss';
 import { ContextBriefing, type ContextReceipt } from './context-briefing';
 import { ChatHistory } from './briefing-history';
 import { OrderedPreparation } from './ordered-preparation';
@@ -499,6 +501,7 @@ interface ActiveState {
 
 /** Message-reaction lifecycle controller (see {@link runReaction}). */
 interface RunReaction {
+  ready: Promise<unknown>;
   /** the run acquired a concurrency slot and is now running → Typing */
   started: () => void;
   /** the run ended (complete / ⏹ / timeout / error) → DONE */
@@ -669,6 +672,113 @@ export function createOrchestrator(
     new ChatHistory(channel, contextConfig.archivePath, contextConfig.pythonCommand), contextConfig,
     `${paths.sessionsFile}.context.json`,
   ) : undefined;
+  const discussEnabled = (p: Project | undefined): boolean => p?.discuss === true && p.kind === 'single' && (!p.backend || p.backend === DEFAULT_BACKEND_ID);
+  const resolvingThreads = new Map<string, Promise<{ thread: AgentThread | undefined; recreated: boolean }>>();
+  const resolutionEpochs = new Map<string, number>();
+  const resolutionChats = new Map<string, string>();
+  function invalidateResolution(key: string): void {
+    resolutionEpochs.set(key, (resolutionEpochs.get(key) ?? 0) + 1);
+    resolvingThreads.delete(key);
+    discussInitializers.delete(key);
+  }
+  function resolutionGuard(key: string): () => void {
+    const epoch = resolutionEpochs.get(key) ?? 0;
+    return () => { if ((resolutionEpochs.get(key) ?? 0) !== epoch) throw new Error('Session resolution superseded'); };
+  }
+  const discussInitializers = new Map<string, Promise<void>>();
+  async function discussSnapshot(key: string, msg: NormalizedMessage): Promise<DiscussSnapshot> {
+    const project = await getProjectByChatId(msg.chatId);
+    const perm = turnSession(msg.chatId, project, msg.senderId);
+    const enabled = discussEnabled(project) && isChatAllowed(cfg, msg.chatId) &&
+      isUserAllowedInProject(cfg, project, msg.senderId) && perm.sessionKey === key;
+    let rec = await getSession(key);
+    if (enabled && !rec && !active.has(key)) {
+      let init = discussInitializers.get(key);
+      if (!init) {
+        const guard = resolutionGuard(key);
+        resolutionChats.set(key, msg.chatId);
+        init = (async () => {
+          if (await getSession(key)) return;
+          guard();
+          const be = backendFor(project?.backend);
+          const thread = await be.startThread({ cwd: project!.cwd, model: project?.defaultModel, effort: project?.defaultEffort,
+            mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact, historyMode: 'legacy' });
+          try { guard(); } catch (error) { await thread.close(); throw error; }
+          trackSession(key, thread, true);
+          const titleJobKey = await registerSessionTitle(be, thread.sessionId, project!.cwd);
+          guard();
+          await upsertSession({ threadId: key, chatId: msg.chatId, cwd: project!.cwd, sessionId: thread.sessionId,
+            backend: be.id, titleJobKey, model: project?.defaultModel, effort: project?.defaultEffort, summary: '', createdAt: Date.now(), updatedAt: Date.now() });
+        })();
+        discussInitializers.set(key, init);
+      }
+      try { await init; } finally { if (discussInitializers.get(key) === init) discussInitializers.delete(key); }
+      rec = await getSession(key);
+    }
+    const models = enabled ? await backendFor(rec?.backend ?? project?.backend).listModels() : [];
+    const selected = models.find(m => m.id === (rec?.model ?? project?.defaultModel)) ?? models.find(m => m.isDefault) ?? models[0];
+    const live = enabled && rec ? (await resolveThread(key, msg.chatId, perm)).thread : undefined;
+    if (live) rec = await getSession(key);
+    if (live && rec?.sessionId !== live.sessionId) throw new Error('Discuss host changed during snapshot');
+    const forkContext = await live?.forkContext?.();
+    const model = rec?.model ?? project?.defaultModel ?? forkContext?.model ?? selected?.id ?? '';
+    const effort = rec?.effort ?? project?.defaultEffort ?? forkContext?.effort ?? selected?.defaultEffort ?? 'medium';
+    const state = active.get(key);
+    return { enabled: enabled && (!rec?.backend || rec.backend === DEFAULT_BACKEND_ID), hostId: rec?.sessionId ?? '',
+      model, effort, sourcePath: forkContext?.path, emptySource: forkContext?.empty, cwd: project?.cwd ?? fallbackCwd, runId: state?.run?.turnId(), busy: Boolean(state), goal: Boolean(state?.isGoal),
+      signature: JSON.stringify([rec?.sessionId, model, effort, perm.mode, perm.network, project?.cwd]) };
+  }
+  const discuss = new Discuss(`${paths.sessionsFile}.discuss.json`,
+    new ChatHistory(channel, contextConfig?.archivePath, contextConfig?.pythonCommand), {
+    snapshot: discussSnapshot,
+
+
+    enabled: async (key, msg) => {
+      const p = await getProjectByChatId(msg.chatId);
+      return discussEnabled(p) && isChatAllowed(cfg, msg.chatId) && isUserAllowedInProject(cfg, p, msg.senderId) && turnSession(msg.chatId, p, msg.senderId).sessionKey === key;
+    },
+    reconcile: async (key, hostId, id) => {
+      const rec = await getSession(key);
+      if (!rec || rec.sessionId !== hostId) return false;
+      const history = await backendFor(rec.backend).readHistory(rec.cwd, hostId, 1000);
+      return history.turns.some(t => t.userText.includes(`[discuss-delivery:${id}]`));
+    },
+    deliver: async (key, messages, action, snapshot, context) => {
+      let attemptedSteer = false;
+      try {
+      const msg = messages.at(-1)!;
+      const project = await getProjectByChatId(msg.chatId);
+      if (!messages.every(m => isUserAllowedInProject(cfg, project, m.senderId) && turnSession(m.chatId, project, m.senderId).sessionKey === key)) return false;
+      const perm = turnSession(msg.chatId, project, msg.senderId);
+      const bodies = await Promise.all(messages.map(async m => `[discuss-delivery:${m.messageId}]\n发送者 ${m.senderName || m.senderId} (${m.senderId})\n${await ingestContext(m, m.content)}`));
+      const images = (await Promise.all(messages.map(m => messageHasImages(m) ? collectInboundImages(channel, m) : Promise.resolve([])))).flat();
+      const current = await discussSnapshot(key, msg);
+      if (!current.enabled || current.signature !== snapshot.signature || current.goal) return false;
+      if (context.receipt.signal?.aborted) return false;
+      const text = weaveMemoryContext(bodies.join('\n\n'), context.block);
+      if (messages.some(messageHasVoice)) {
+        startReservedRun(msg, text, key, true, project, perm, images, true, msg.content, undefined, context.receipt);
+      } else if (action === 'STEER') {
+        const state = active.get(key);
+        if (!snapshot.runId || current.runId !== snapshot.runId || !state?.thread || !state.run) return false;
+        // Uncertain transport failures remain unknown for history reconciliation.
+        attemptedSteer = true;
+        await steerWithDeadline(state.thread, { text, images }, snapshot.runId, context.receipt.signal);
+        context.receipt.accepted(key, snapshot.hostId);
+      } else {
+        if (active.has(key)) return false;
+        startReservedRun(msg, text, key, true, project, perm, images, true, msg.content, undefined, context.receipt);
+      }
+      return true;
+      } catch (err) {
+        // Only an attempted steer with an uncertain acknowledgment may have
+        // reached the host; preparation failures remain safe to retry.
+        if (attemptedSteer && !isRejectedSteer(err)) throw err;
+        log.warn('intake', 'discuss-delivery-rejected', { reason: err instanceof VoiceError ? err.message : 'delivery rejected' });
+        return false;
+      }
+    },
+  });
   const voiceShutdown = new AbortController();
   const voiceIntake = new VoiceIntake();
   const voiceQueued = new WeakSet<NormalizedMessage>();
@@ -682,6 +792,9 @@ export function createOrchestrator(
     return pending;
   }
   function voiceFailed(msg: NormalizedMessage, flat: boolean, err: unknown): void {
+    finishEarly(msg);
+    const key = earlyReactionKeys.get(msg);
+    if (key) void discuss.releaseTakeover(key, (directHistory.get(msg) ?? []).map(m => m.messageId)).catch(() => undefined);
     const detail = err instanceof VoiceError ? err.message : '语音处理失败，请重发或改发文字';
     log.warn('intake', 'voice-failed', { msgId: msg.messageId, detail });
     void channel.send(msg.chatId, { markdown: `❌ ${detail}。本条语音未提交给模型。` },
@@ -690,9 +803,13 @@ export function createOrchestrator(
   const contextIntake = new OrderedPreparation();
   const contextTargets = new Map<string, NormalizedMessage>();
   const cancelContext = (key: string): void => {
+    invalidateResolution(key);
+    for (const msg of earlyReactions.keys()) if (earlyReactionKeys.get(msg) === key) finishEarly(msg);
     briefings?.cancel(key);
+    discuss.cancel(key);
     const count = contextIntake.cancel(key) + voiceIntake.cancel(key);
     const target = contextTargets.get(key);
+    if (target) finishEarly(target);
     contextTargets.delete(key);
     if (count && target) void channel.send(target.chatId,
       { markdown: `⚠️ ${count} 条尚未提交的消息已取消，请按需重发。` },
@@ -725,6 +842,7 @@ export function createOrchestrator(
    * 拦截 —— 否则会先贴上 🎯OKR 受理回执、再被能力守卫拒绝，留下一个自相矛盾的假信号
    * （e2e 实测发现）。引导用户直接派活即可。 */
   async function denyGoal(msg: NormalizedMessage, inThread: boolean): Promise<void> {
+    finishEarly(msg);
     await channel
       .send(
         msg.chatId,
@@ -796,7 +914,8 @@ export function createOrchestrator(
    * （touchSession）打点；空闲时长 = now − 最后打点。 */
   const sessionTouchedAt = new Map<string, number>();
   /** sessions.set + 打点 —— 所有放进 LIVE 缓存的会话一律走这里。 */
-  function trackSession(key: string, thread: AgentThread): void {
+  function trackSession(key: string, thread: AgentThread, restoring = false): void {
+    if (!restoring) invalidateResolution(key);
     sessions.set(key, thread);
     sessionTouchedAt.set(key, Date.now());
   }
@@ -908,6 +1027,7 @@ export function createOrchestrator(
       });
     };
     return {
+      ready: chain,
       started: () => {
         if (phase < 1) {
           phase = 1;
@@ -924,6 +1044,13 @@ export function createOrchestrator(
         }
       },
     };
+  }
+
+  const earlyReactions = new Map<NormalizedMessage, RunReaction>();
+  const earlyReactionKeys = new WeakMap<NormalizedMessage, string>();
+  const directHistory = new WeakMap<NormalizedMessage, NormalizedMessage[]>();
+  function finishEarly(msg: NormalizedMessage): void {
+    earlyReactions.get(msg)?.done(); earlyReactions.delete(msg);
   }
 
   // ── inbound messages ──────────────────────────────────────────────
@@ -956,9 +1083,24 @@ export function createOrchestrator(
 
     const project = await getProjectByChatId(msg.chatId);
     if (project && isChatAllowed(cfg, msg.chatId) && isUserAllowedInProject(cfg, project, msg.senderId)) briefings?.observe(msg);
+    if (project && discussEnabled(project) && isChatAllowed(cfg, msg.chatId) && isUserAllowedInProject(cfg, project, msg.senderId)) {
+      const key = turnSession(msg.chatId, project, msg.senderId).sessionKey;
+      const command = Boolean(parseCommand(msg.content.trim()));
+      if (msg.mentionedBot && !command) {
+        const reaction = runReaction(msg.messageId, false);
+        earlyReactions.set(msg, reaction);
+        earlyReactionKeys.set(msg, key);
+        try {
+          const prior = await discuss.takeover(key, msg);
+          directHistory.set(msg, prior);
+          await reaction.ready;
+        } catch (error) { reaction.done(); earlyReactions.delete(msg); throw error; }
+      } else await discuss.observe(key, msg, command, command);
+      if (!msg.mentionedBot && !command) return;
+    }
     // @门：没 @ 时只在「项目群 + 免@ 适用」才响应。免@默认开,但 multi 仅话题内、
     // single 整群;非项目群一律不响应非 @ 消息。
-    if (!msg.mentionedBot && !(project && shouldRespondWithoutMention(project, msg))) return;
+    if (!msg.mentionedBot && !(project && (shouldRespondWithoutMention(project, msg) || (discussEnabled(project) && parseCommand(msg.content.trim()))))) return;
     if (!isChatAllowed(cfg, msg.chatId) || !isUserAllowedInProject(cfg, project, msg.senderId)) {
       log.info('intake', 'reject', { reason: 'not_allowed', chatId: msg.chatId.slice(-6) });
       return;
@@ -1296,7 +1438,7 @@ export function createOrchestrator(
     prepared?: { text: string; images?: string[]; receipt: ContextReceipt; signal?: AbortSignal },
     voicePrepared = false,
   ): Promise<void> {
-    if (prepared?.signal?.aborted) { prepared.receipt.rejected(); return; }
+    if (prepared?.signal?.aborted) { finishEarly(msg); prepared.receipt.rejected(); return; }
     // Reserve an ordered preparation lane before starting ASR. Later messages
     // in this session wait behind it; other topics and card actions stay free.
     if (!prepared && !voicePrepared && (messageHasVoice(msg) || voiceIntake.hasPending(sessionKey))) {
@@ -1311,6 +1453,31 @@ export function createOrchestrator(
         if (signal.aborted) return;
         await handleTurn(msg, body, sessionKey, flat, project, perm, undefined, true);
       }, err => voiceFailed(msg, flat, err));
+      return;
+    }
+    if (discussEnabled(project) && !prepared) {
+      contextTargets.set(sessionKey, msg);
+      contextIntake.submit(sessionKey, async signal => {
+        const snapshot = await discussSnapshot(sessionKey, msg);
+        const prior = directHistory.get(msg) ?? [];
+        const context = await discuss.context(sessionKey, snapshot.hostId, [...prior.map(m => m.messageId), msg.messageId]);
+        context.receipt.signal = signal;
+        signal.addEventListener('abort', () => context.receipt.rejected(), { once: true });
+        const priorBodies = await Promise.all(prior.map(async m => `[discuss-delivery:${m.messageId}]\n发送者 ${m.senderName || m.senderId}：\n${await ingestContext(m, m.content)}`));
+        const instruction = text.trim() || '请结合本条 @ 前的群聊消息，回应尚未处理的请求；如果没有明确请求，请询问我需要处理什么。';
+        const body = await ingestContext(msg, `[discuss-delivery:${msg.messageId}]\n${instruction}`);
+        const history = priorBodies.length ? `[本次 @ 接管的待处理消息简史]\n${priorBodies.join('\n\n')}\n[简史结束]\n` : '';
+        const images = (await Promise.all([...prior, msg].map(m => messageHasImages(m) ? collectInboundImages(channel, m) : Promise.resolve([])))).flat();
+        signal.throwIfAborted();
+        return { signal, text: weaveMemoryContext(history + body, context.block), images, receipt: context.receipt };
+      }, async input => {
+        await handleTurn(msg, text, sessionKey, flat, project, perm, input);
+        await input.receipt.settled;
+      }, err => {
+        finishEarly(msg);
+        void discuss.releaseTakeover(sessionKey, (directHistory.get(msg) ?? []).map(m => m.messageId)).catch(() => undefined);
+        log.fail('intake', err, { phase: 'discuss-direct' });
+      });
       return;
     }
     if (briefings && !prepared) {
@@ -1379,11 +1546,13 @@ export function createOrchestrator(
           try {
             await steerWithDeadline(cur.thread, { text: woven, images }, tid, prepared?.signal);
             prepared?.receipt.accepted(sessionKey, cur.thread.sessionId);
+            finishEarly(msg);
             log.info('intake', 'steer', { tid, images: images?.length ?? 0 });
             return;
           } catch (err) {
             log.warn('intake', 'steer-failed', { err: String(err) });
             if (!isRejectedSteer(err)) {
+              finishEarly(msg);
               prepared?.receipt.rejected();
               if (!prepared?.signal?.aborted) void channel.send(msg.chatId,
                 { markdown: '⚠️ 本条消息的接收确认失败，可能已进入模型。为避免重复执行，未自动重投；请先核对本轮结果。' },
@@ -1396,7 +1565,7 @@ export function createOrchestrator(
       // steer() awaited an RPC: the previous run may have ended, or a new
       // run/goal may now own this key. Re-enter the synchronous reservation
       // path so the input is queued on the current owner or starts a new run.
-      if (prepared?.signal?.aborted) { prepared.receipt.rejected(); return; }
+      if (prepared?.signal?.aborted) { finishEarly(msg); prepared.receipt.rejected(); return; }
       if (cur.thread && !cur.thread.isAlive() && active.get(sessionKey) === cur) {
         active.delete(sessionKey);
         if (sessions.get(sessionKey) === cur.thread) sessions.delete(sessionKey);
@@ -1411,6 +1580,7 @@ export function createOrchestrator(
 
   /** 🎯 goal 运行中收到消息的统一提示（goal 会话不入队，见 ActiveState.isGoal）。 */
   async function replyGoalBusy(msg: NormalizedMessage, flat: boolean): Promise<void> {
+    finishEarly(msg);
     await channel
       .send(
         msg.chatId,
@@ -1477,6 +1647,7 @@ export function createOrchestrator(
         requestedAt: msg.createTime || Date.now(),
         summary: stripFileTokens(summaryText ?? text).slice(0, 80) || undefined,
       });
+      if (contextReceipt) void contextReceipt.settled.finally(() => finishEarly(msg));
       log.info('intake', 'queued', { depth: existing.queue.length });
       return;
     }
@@ -1485,7 +1656,8 @@ export function createOrchestrator(
     void withTrace({ chatId: msg.chatId, msgId: msg.messageId }, async () => {
       // Goal runs use the OKR reaction (added at dispatch) as their only receipt,
       // not the ⏳/🫳 run-reaction lifecycle.
-      const reaction = goal ? undefined : runReaction(msg.messageId, !sema.hasFree());
+      const reaction = goal ? undefined : earlyReactions.get(msg) ?? runReaction(msg.messageId, !sema.hasFree());
+      earlyReactions.delete(msg);
       try {
         const tIntake = Date.now();
         // ── 入站三路并行（M-1）── 飞书 API（图片下载 / 文件+引用织入）、本地
@@ -1550,7 +1722,7 @@ export function createOrchestrator(
           // a fresh session bound to the resolved cwd, on the project's backend.
           const cwd = project?.cwd ?? fallbackCwd;
           const be = backendFor(project?.backend);
-          thread = await be.startThread({ cwd, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
+          thread = await be.startThread({ cwd, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact, ...(discussEnabled(project) ? { historyMode: 'legacy' as const } : {}) });
           trackSession(sessionKey, thread);
           // 自愈观测：来源=全新会话（无持久化记录），与 resume-ok/resume-recreate
           // 互斥——三者其一 + agent 层的 spawn/prewarm-hit 即可还原完整恢复路径。
@@ -1682,6 +1854,24 @@ export function createOrchestrator(
     chatId: string,
     perm?: { mode?: PermissionMode; network?: boolean; autoCompact?: boolean },
   ): Promise<{ thread: AgentThread | undefined; recreated: boolean }> {
+    // Judge, summary and incoming turns can concurrently request the same host.
+    // A duplicate resume hits Codex's writer lock and must not recreate history.
+    let pending = resolvingThreads.get(threadId);
+    if (!pending) {
+      resolutionChats.set(threadId, chatId);
+      pending = resolveThreadOnce(threadId, chatId, perm, resolutionGuard(threadId));
+      resolvingThreads.set(threadId, pending);
+    }
+    try { return await pending; }
+    finally { if (resolvingThreads.get(threadId) === pending) resolvingThreads.delete(threadId); }
+  }
+  async function resolveThreadOnce(
+    threadId: string,
+    chatId: string,
+    perm: { mode?: PermissionMode; network?: boolean; autoCompact?: boolean } | undefined,
+    guard: () => void,
+  ): Promise<{ thread: AgentThread | undefined; recreated: boolean }> {
+    guard();
     const live = sessions.get(threadId);
     if (live) {
       if (live.isAlive()) return { thread: live, recreated: false };
@@ -1698,6 +1888,7 @@ export function createOrchestrator(
     // later must not strand existing sessions on the wrong runtime; the project
     // is still consulted for cwd / tier defaults on the recreate path below.
     const project = await getProjectByChatId(chatId);
+    guard();
     const be = backendFor(rec.backend);
     try {
       const resumed = await be.resumeThread({
@@ -1709,13 +1900,20 @@ export function createOrchestrator(
         network: perm?.network,
         autoCompact: perm?.autoCompact,
       });
-      trackSession(threadId, resumed);
+      try {
+        const current = await getSession(threadId);
+        guard();
+        if (current?.sessionId !== rec.sessionId) throw new Error('Session resolution superseded');
+      } catch (error) { await resumed.close().catch(() => undefined); throw error; }
+      trackSession(threadId, resumed, true);
       // 自愈观测：resume 来源=持久化记录（区分「resume 自愈」与 LIVE 快路径的
       // 普通续轮——后者不经过这里，stream.timing 的 tResolve≈0 是它的指纹）。
       log.info('agent', 'resume-ok', { threadId, sessionId: rec.sessionId, backend: be.id });
       return { thread: resumed, recreated: false };
     } catch (err) {
       log.fail('agent', err, { phase: 'resume-on-turn', threadId });
+      guard();
+      if (/already has an active writer|Session resolution superseded/.test(String(err))) throw err;
       const cwd = project?.cwd ?? rec.cwd ?? fallbackCwd;
       const fresh = await be.startThread({
         cwd,
@@ -1724,8 +1922,14 @@ export function createOrchestrator(
         mode: perm?.mode ?? project?.mode,
         network: perm?.network ?? project?.network,
         autoCompact: perm?.autoCompact ?? project?.autoCompact,
+        ...(discussEnabled(project) ? { historyMode: 'legacy' as const } : {}),
       });
-      trackSession(threadId, fresh);
+      try {
+        const current = await getSession(threadId);
+        guard();
+        if (current?.sessionId !== rec.sessionId) throw new Error('Session resolution superseded');
+      } catch (error) { await fresh.close().catch(() => undefined); throw error; }
+      trackSession(threadId, fresh, true);
       // The resumed codex thread is gone — repoint the persisted record at the
       // new thread id so a later restart doesn't keep resuming the dead one.
       await patchSession(threadId, { sessionId: fresh.sessionId }).catch(() => undefined);
@@ -1734,7 +1938,6 @@ export function createOrchestrator(
       return { thread: fresh, recreated: true };
     }
   }
-
 
   /**
    * Close every LIVE codex thread under `chatId` so a permission-tier change
@@ -1746,9 +1949,12 @@ export function createOrchestrator(
    * to re-resume under the new tier (or fail-closed where it can't be enforced).
    */
   async function evictLiveSessionsForChat(chatId: string): Promise<void> {
+    for (const [key, chat] of resolutionChats) if (chat === chatId) invalidateResolution(key);
     let closed = 0;
     for (const rec of await listSessions()) {
       if (rec.chatId !== chatId) continue;
+      invalidateResolution(rec.threadId);
+      discuss.cancel(rec.threadId);
       const live = sessions.get(rec.threadId);
       if (!live) continue;
       sessions.delete(rec.threadId); // synchronous: next turn can't reuse it
@@ -1793,7 +1999,7 @@ export function createOrchestrator(
           model: project?.defaultModel,
           effort: project?.defaultEffort,
         });
-        const thread = await be.startThread({ cwd, model, effort, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
+        const thread = await be.startThread({ cwd, model, effort, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact, ...(discussEnabled(project) ? { historyMode: 'legacy' as const } : {}) });
         tResolveDone = Date.now();
         return { thread, model, effort };
       })();
@@ -2056,6 +2262,7 @@ export function createOrchestrator(
           // drains the stream to turn/completed), so the card flips at the right
           // time AND no stale `done` leaks into the next turn.
           const { usage } = await thread.compact();
+          discuss.refresh(sessionKey);
           if (usage) lastUsage.set(sessionKey, { used: usage.usedTokens, window: usage.contextWindow });
           else lastUsage.delete(sessionKey); // refreshes on the next turn's usage event
           log.info('intake', 'compact', { sessionKey, used: usage?.usedTokens ?? null, before: before?.used ?? null });
@@ -2128,6 +2335,7 @@ export function createOrchestrator(
           mode: perm.mode,
           network: perm.network,
           autoCompact: perm.autoCompact,
+          ...(discussEnabled(project) ? { historyMode: 'legacy' as const } : {}),
         });
         // Close + evict the parked live thread (a separate app-server proc); its
         // on-disk session survives for /resume. Then track the fresh one.
@@ -3591,7 +3799,15 @@ export function createOrchestrator(
         return buildGroupSettingsCard({ name: '本群', kind: 'multi', noMention: on });
       });
     })
-
+    .on(GS.setDiscuss, ({ evt, value }) => {
+      if (!isAdmin(cfg, evt.operator?.openId ?? '') || !['on', 'off'].includes(String(value.v))) return;
+      patch(evt, async () => {
+        const project = await getProjectByChatId(evt.chatId);
+        if (!project) return buildGroupSettingsCard({ name: '本群', kind: 'multi' });
+        const result = await performSetDiscuss({ projectName: project.name, on: value.v === 'on' });
+        return buildGroupSettingsCard(result.ok ? result.project : project);
+      });
+    })
 
 
     .on(GS.setContextBriefing, ({ evt, value }) => {
@@ -3785,7 +4001,15 @@ export function createOrchestrator(
         return buildProjectSettingsCard(r.project, backendDisplayName(r.project.backend));
       });
     })
-
+    .on(DM.setDiscussDm, ({ evt, value }) => {
+      if (!dmAdmin(evt.operator?.openId) || !['on', 'off'].includes(String(value.v))) return;
+      const name = typeof value.n === 'string' ? value.n : '';
+      patch(evt, async () => {
+        const result = await performSetDiscuss({ projectName: name, on: value.v === 'on' });
+        return result.ok ? buildProjectSettingsCard(result.project, backendDisplayName(result.project.backend))
+          : buildDmMenuCard({ webConsoleUrl: webConsoleUrl(), version: bridgeVersion() });
+      });
+    })
 
 
     .on(DM.setContextBriefingDm, ({ evt, value }) => {
@@ -3955,6 +4179,7 @@ export function createOrchestrator(
               createdAt: now,
               updatedAt: now,
             });
+            discuss.cancel(sessionKey);
             log.info('card', 'resume-done-single', { sessionKey, sessionId, turns: history.totalTurns });
           });
           settleUpdate(evt.messageId, buildResumeDoneCard(state));
@@ -4482,6 +4707,7 @@ export function createOrchestrator(
             const cu = ev as { usedTokens: number; contextWindow: number | null };
             lastUsage.set(topicThreadId, { used: cu.usedTokens, window: cu.contextWindow });
           } else if (et === 'context_compacted') {
+            discuss.refresh(activeKey);
             // Only genuine auto-compaction reaches the turn loop — a manual
             // /compact drains its own events in runCompact, so this is always an
             // auto-compaction → post the special notice (non-blocking).
@@ -4500,6 +4726,7 @@ export function createOrchestrator(
           // typewriter (cardElement.content), structure → whole-card update.
           stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID);
         }
+        discuss.refresh(activeKey, finalMessageText(render.snapshot()) || '(本轮结束，无文本回复)');
         state.run = undefined; // completion-card I/O must queue, never steer into a finished turn
         const doneAt = Date.now(); // codex stopped emitting / loop ended
         stopper.dispose(); // 事件流已收尾：撤掉 ⏹ 的 5s 强停兜底定时器
@@ -4660,6 +4887,7 @@ export function createOrchestrator(
       for (const queued of state.queue) queued.input.contextReceipt?.rejected();
       const dropped = state.queue.splice(0).length;
       disposeInterrupt?.();
+      discuss.refresh(activeKey);
       state.run = undefined;
       state.interrupt = undefined;
       // A stream/card failure can leave an agent turn running. Retire that
@@ -5564,10 +5792,13 @@ export function createOrchestrator(
 
   async function shutdown(): Promise<void> {
     clearInterval(reaper);
+    for (const key of resolutionChats.keys()) invalidateResolution(key);
+    for (const msg of earlyReactions.keys()) finishEarly(msg);
     voiceShutdown.abort();
     voiceIntake.close();
     contextIntake.close();
     await briefings?.close();
+    await discuss.close();
     await sessionTitles.shutdown();
     // adopt 失败的孤儿线程已在 launchRun/launchGoalRun 的 finally 就地 close，
     // 这里只需回收 LIVE 会话缓存。

@@ -203,6 +203,8 @@ export interface TurnOptions {
 }
 
 export interface AgentThread {
+  /** Read metadata without consuming notifications. Empty new threads have no rollout yet. */
+  forkContext?(): Promise<{ path?: string; empty: boolean; model?: string; effort?: ReasoningEffort }>;
 
   /** backend session id（codex 的 thread id，其它后端可能是 session UUID）——持久化进
    * SessionRecord.sessionId，重启后经 resumeThread 找回同一会话。 */
@@ -239,6 +241,8 @@ export interface AgentThread {
 }
 
 export interface StartThreadOptions {
+  /** Required by cross-process forks on Codex 0.154. */
+  historyMode?: 'legacy';
   cwd: string;
   model?: string;
   effort?: ReasoningEffort;

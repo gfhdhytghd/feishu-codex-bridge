@@ -1,0 +1,29 @@
+# Discuss 群聊参与模式
+
+项目设置中的 Discuss 默认关闭，只允许 Codex 单会话群。在 Web 项目设置、私聊项目设置和群内 `/settings` 均可开关。开启期间接管普通消息的免 @ 路由及上下文策略；关闭后恢复原来的 noMention 和 contextBriefing 设置值。现有多话题群不受影响。
+
+## 消息与上下文
+
+- 鉴权后，按 bot、群和既有 admin/guest 会话分区记录入站消息。原始身份、时间、引用和附件元数据保存在 `sessions.json.discuss.json.messages.jsonl`；队列、摘要、版本及回执在 `sessions.json.discuss.json`。文件权限为 0600。
+- 普通消息采用 1 秒防抖、最长 3 秒一批。批次编号持久化；判断与 Luna 分别串行处理各批，互不等待，各最多 2 个并发任务，不占主 Agent 并发槽。
+- @ 立即废弃在途判断，并接管当前分区尚未判断/排队的消息，将原文、投递 ID 和附件放入本次消息简史后直接交给主 Agent，不等待 Luna。准备简史前先添加处理表情，启动主轮次时复用，完成后移除；单独 @ 也带明确的处理指令。已有命令直接走原路由。普通消息逐条判断 IGNORE、FOLLOW_UP 或 STEER。FOLLOW_UP 等主会话空闲；STEER 只投向判断时的同一个活动 turn。正式 goal 的既有外部输入规则保留。
+- 主 Agent 与判断器使用相同模型和 reasoning effort。判断 fork 不续做继承任务，不具有原生执行、修改、网络、MCP、插件或委派能力。必要查询通过结构化 lookup 交给宿主：本项目内普通文件、本群历史；最多 3 次、返回总量最多 64 KiB，拒绝路径和符号链接逃逸。
+- 主轮次结束后废弃判断 fork，下批从最新主线程重新建立。主线程运行期间从当前 turn 之前分叉，并附当前 turn ID。压缩、清空、恢复、权限变更或模型变更会使旧判断失效。判断上下文累积 64 批或 64,000 字符后也重建；字符阈值是保守的长度预算，并非精确 token 数。
+- Luna 固定 `gpt-5.6-luna` / `low`，使用独立持续对话逐批维护完整摘要，包括主题、未结请求、约束、决定、结果与不确定性，每项带消息 ID。主 Agent 的结束文本也进入摘要队列。首次最多取近 24 小时中最近 100 条历史，历史缺口随摘要保留。
+- 主 Agent 只取已完成的摘要版本和其后未注入的原文，不等待 Luna、不临时再调用 Luna。摘要和原文游标在模型确认接受后推进。Discuss 下跳过旧的一次性简报路径；其他项目保留旧行为。
+
+## 生命周期与恢复
+
+判断和摘要单次任务最多 60 秒，失败最多重试两次，随后冷却 60 秒。摘要故障时主线程继续使用原文。Luna 正常运行期间复用对话，依赖 Codex 自动压缩；Luna 会话 ID 和隔离 Codex home 持久化在每个分区自己的辅助目录；进程重建优先 resume 原会话，无法恢复时才用持久摘要和未覆盖批次重建，不替换模型。
+
+投递前先写 unknown，收到 turn_started 或 steer 成功后才写 accepted。重启时 unknown 只通过主历史的投递标记核对，不盲目重发；无法确认的输入继续保留 unknown。停止或关闭会取消未提交工作，新输入可重新进入；取消不删除原始日志。权限分区改变后，旧分区的工作不会投向新分区。
+
+隔离 fork 同时支持 legacy 与 paginated 历史：把源 rollout 原样复制到临时 Codex home 的 sessions 目录，让原生索引识别源会话，并指定 excludeTurns，避免要求 ephemeral paginated fork 返回完整历史。复制不修改主会话或共享数据库，临时目录随判断器关闭清理。全新线程在首轮前尚无 rollout，此时判断器先用空背景独立线程；首次主回复后改为真正 fork。临时 fork 不设置不兼容的 deferGoalContinuation。
+
+## 验证与观测
+
+`npm run typecheck`、`npm test`、`npm run build`。`DISCUSS_LIVE=1 npx vitest run test/discuss-live.test.ts` 使用真实 Codex 验证继承上下文与辅助会话续轮，不发送飞书消息，结束时归档测试主线程并关闭辅助进程。
+
+日志记录判断数量、耗时、摘要积压、查询字节和 Codex 报告的输入/缓存输入/输出 token，不记录消息正文。fork 复用的是会话历史；是否命中服务端缓存以 cachedInputTokens 为准，不保证共享 KV 或固定成本下降。
+
+生产默认关闭。本次代码验证不自动重启 daemon，也不自动为群启用 Discuss。

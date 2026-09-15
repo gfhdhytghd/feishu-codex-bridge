@@ -52,6 +52,8 @@ export interface Project {
   autoCompact?: boolean;
   /** Conditional Luna briefing; off keeps raw new-message context. Default on. */
   contextBriefing?: boolean;
+  /** Fork-based group participation, single Codex sessions only; default off. */
+  discuss?: boolean;
   /** agent backend id for this project (see src/agent/index.ts registry).
    * Omitted on old/normal data → the codex default (DEFAULT_BACKEND_ID — historical path,
    * zero behavior change). Routed per project in createOrchestrator's
