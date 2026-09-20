@@ -2,6 +2,7 @@ import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { log } from '../core/logger';
 import type { CardObject } from './cards';
 import { isCardIdNotReady } from './managed';
+import type { StreamingImages } from './outbound-images';
 
 /**
  * Min gap between throttled stream pushes. Finer = smoother chunked growth
@@ -92,6 +93,10 @@ function isRateLimited(err: unknown): boolean {
  * streams and carries clickable controls (⏹).
  */
 export class RunCardStream {
+  /** Optional per-turn background image uploader (see {@link setImageWorker}).
+   * Deliberately not part of the push path: event consumption asks it to scan,
+   * never waits on it. */
+  private imageWorker: { uploads: StreamingImages; text: () => string } | null = null;
   private cardId = '';
   private _messageId = '';
   private seq = 0;
@@ -144,12 +149,41 @@ export class RunCardStream {
   }
 
   /**
+   * Attach the turn's background image uploader. `text` returns the answer as it
+   * stands (see {@link ../card/run-card}.runningAnswerText) — it's scanned for
+   * new `![](…)` refs on every frame, and a resolved `image_key` repaints the
+   * live card, which is how an image appears mid-turn instead of only at the end.
+   */
+  setImageWorker(uploads: StreamingImages, text: () => string): void {
+    this.imageWorker = { uploads, text };
+  }
+
+  /**
+   * Resolve this turn's images for the terminal frame. Bounded by
+   * {@link StreamingImages.finalize}'s own deadline, because the terminal frame
+   * is sequenced behind it — an upload that never settles must not leave the card
+   * on 「正在输出」forever.
+   *
+   * Returns an empty map when no uploader was attached ({@link setImageWorker}).
+   * Production always attaches one right after creating the stream (see
+   * {@link ./run-card}.attachRunImages), so that only covers a stream driven
+   * directly (a test, or a caller that only ever renders text).
+   */
+  async settleImages(finalAnswer: string): Promise<ReadonlyMap<string, string>> {
+    if (!this.imageWorker) return new Map();
+    return this.imageWorker.uploads.finalize(finalAnswer);
+  }
+
+  /**
    * Record the latest card and ensure the pump is running. Returns immediately;
    * calls that arrive while a push is in flight collapse into a single push of
    * the most recent card once that round-trip completes. Use this from the
    * event-consume loop instead of awaiting {@link streamCard} per event.
    */
   streamCoalesced(channel: LarkChannel, fullCard: CardObject, answerEid: string | null): void {
+    // Kick the image uploader off the same snapshot the frame was built from, so
+    // a ref starts uploading the moment the model finishes writing it.
+    this.imageWorker?.uploads.refresh(this.imageWorker.text());
     this.pending = { card: fullCard, answerEid };
     this.pumpChannel = channel;
     if (!this.pumpPromise) this.pumpPromise = this.pump();
@@ -213,11 +247,14 @@ export class RunCardStream {
    * pump only advances its baselines on delivered frames). */
   private async streamElement(channel: LarkChannel, elementId: string, content: string): Promise<boolean> {
     if (!this.cardId) return false;
-    const push = (): Promise<unknown> =>
-      channel.rawClient.cardkit.v1.cardElement.content({
-        path: { card_id: this.cardId, element_id: elementId },
-        data: { content, sequence: ++this.seq, uuid: `e_${this.cardId}_${this.seq}` },
-      });
+    const push = async (): Promise<void> => {
+      assertCardkitSuccess(
+        await channel.rawClient.cardkit.v1.cardElement.content({
+          path: { card_id: this.cardId, element_id: elementId },
+          data: { content, sequence: ++this.seq, uuid: `e_${this.cardId}_${this.seq}` },
+        }),
+      );
+    };
     await this.pacer?.wait();
     const t0 = Date.now();
     try {
@@ -227,14 +264,16 @@ export class RunCardStream {
         const code = cardkitErrCode(err);
         if (code === ERR_STREAMING_OFF) {
           log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, reopenStreaming: true });
-          await channel.rawClient.cardkit.v1.card.settings({
-            path: { card_id: this.cardId },
-            data: {
-              settings: JSON.stringify({ config: { streaming_mode: true } }),
-              sequence: ++this.seq,
-              uuid: `o_${this.cardId}_${this.seq}`,
-            },
-          });
+          assertCardkitSuccess(
+            await channel.rawClient.cardkit.v1.card.settings({
+              path: { card_id: this.cardId },
+              data: {
+                settings: JSON.stringify({ config: { streaming_mode: true } }),
+                sequence: ++this.seq,
+                uuid: `o_${this.cardId}_${this.seq}`,
+              },
+            }),
+          );
           await push();
         } else if (code === ERR_SEQ_OUT_OF_ORDER) {
           log.fail('card', err, { phase: 'run-stream-el', cardId: this.cardId, seq: this.seq, retry: true });
@@ -332,10 +371,12 @@ export class RunCardStream {
     await this.pacer?.wait();
     const t0 = Date.now();
     try {
-      await channel.rawClient.cardkit.v1.card.update({
-        path: { card_id: this.cardId },
-        data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `s_${this.cardId}_${this.seq}` },
-      });
+      assertCardkitSuccess(
+        await channel.rawClient.cardkit.v1.card.update({
+          path: { card_id: this.cardId },
+          data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `s_${this.cardId}_${this.seq}` },
+        }),
+      );
       this.lastContent = data;
       const rtt = Date.now() - t0;
       this.pushCount++;
@@ -409,10 +450,12 @@ export class RunCardStream {
   private async pushForcedUpdate(channel: LarkChannel, data: string): Promise<boolean> {
     if (!this.cardId) return false;
     const push = async (): Promise<void> => {
-      await channel.rawClient.cardkit.v1.card.update({
-        path: { card_id: this.cardId },
-        data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `u_${this.cardId}_${this.seq}` },
-      });
+      assertCardkitSuccess(
+        await channel.rawClient.cardkit.v1.card.update({
+          path: { card_id: this.cardId },
+          data: { card: { type: 'card_json', data }, sequence: ++this.seq, uuid: `u_${this.cardId}_${this.seq}` },
+        }),
+      );
       this.lastContent = data;
     };
     for (let i = 0; ; i++) {
@@ -465,4 +508,19 @@ function structureSig(card: CardObject, eid: string | null): string {
   if (!eid || !Array.isArray(els)) return JSON.stringify(card);
   const blanked = els.map((el) => (el && el.element_id === eid ? { ...el, content: '' } : el));
   return JSON.stringify({ ...(card as object), body: { ...body, elements: blanked } });
+}
+
+/**
+ * The SDK resolves HTTP 200 business failures (`{code: 230099, msg: …}`) instead
+ * of rejecting, so without this check a rejected card write counts as delivered:
+ * `lastContent` advances and the frame is never retried. That silently drops the
+ * TERMINAL frame in particular — the run is over but the card keeps its running
+ * layout with a live ⏹ cursor (issue #14 "一显示就卡"). Throwing here routes the
+ * failure into the existing retry/self-heal paths.
+ */
+function assertCardkitSuccess(response: unknown): void {
+  const result = response as { code?: number; msg?: string } | null;
+  if (typeof result?.code === 'number' && result.code !== 0) {
+    throw Object.assign(new Error(result.msg ?? `cardkit error ${result.code}`), { code: result.code });
+  }
 }

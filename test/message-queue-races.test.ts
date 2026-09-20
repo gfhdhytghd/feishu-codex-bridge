@@ -32,6 +32,8 @@ vi.mock('../src/card/run-card-stream', () => ({
     create = fake.createCard;
     streamCoalesced() {}
     async drain() {}
+    setImageWorker() {}
+    async settleImages() { return new Map(); }
     updateCard = fake.final;
     finalizeCard = fake.final;
     stats() { return { pushCount: 0, cardPushes: 0, elPushes: 0, totalRttMs: 0, maxRttMs: 0 }; }

@@ -10,6 +10,7 @@ import type {
 import { DEFAULT_BACKEND_ID, backendIds, createBackend, isBackendEntryInstalled } from '../agent';
 import { catalogById, projectCreatableBackends, visibleCatalog } from '../agent/catalog';
 import {
+  DEFAULT_PERMISSION_MODE,
   REASONING_EFFORTS,
   type AgentBackend,
   type AgentInput,
@@ -90,12 +91,14 @@ import {
   buildRunCardPlain,
   CONTROLS_EID,
   RC,
+  attachRunImages,
   type RunCardState,
 } from '../card/run-card';
 import { buildGoalDoneCard } from '../card/goal-card';
 import { RunCardStream } from '../card/run-card-stream';
-import { buildCleanCard, extractCardFences } from '../card/markdown-render';
-import { imageSources, uploadOutboundImages } from '../card/outbound-images';
+import { buildCleanCard } from '../card/markdown-render';
+import { extractCardFences } from '../card/md-scan';
+import { uploadOutboundImages } from '../card/outbound-images';
 import {
   buildAutoCompactCard,
   buildCompactFailedCard,
@@ -1528,6 +1531,14 @@ export function createOrchestrator(
           firstText,
           images,
           knownThreadId: sessionKey,
+          // The run's cwd: the project directory the agent works in. MUST be
+          // carried here — it is also what resolves a reply's relative
+          // `![](images/plot.png)` before upload, and what gets persisted as this
+          // session's cwd. Omitting it silently fell back to the bridge process's
+          // own cwd (the launchd service has none → `/`), so every relative image
+          // ref was resolved against `/` and rejected as image-outside-cwd.
+          cwd: project?.cwd ?? prior?.cwd ?? fallbackCwd,
+          mode: perm.mode,
           summary: stripFileTokens(summaryText ?? text).slice(0, 80) || '(本轮任务)',
           requesterOpenId: msg.senderId,
           requestedAt: msg.createTime || tIntake,
@@ -1720,6 +1731,7 @@ export function createOrchestrator(
         model,
         effort,
         cwd,
+        mode: perm.mode,
         summary: stripFileTokens(text).slice(0, 80) || '(空)',
         requesterOpenId: msg.senderId,
         requestedAt: msg.createTime || tIntake,
@@ -3888,7 +3900,12 @@ export function createOrchestrator(
     knownThreadId?: string;
     model?: string;
     effort?: ReasoningEffort;
+    /** The run's workspace. Resolves relative `![](…)` image refs in the reply
+     * and is persisted as the session's cwd — NOT the bridge process's cwd. */
     cwd?: string;
+    /** The turn's permission mode; a `full` project may reference images outside
+     * {@link cwd} (see ../card/outbound-images). */
+    mode?: PermissionMode;
     summary?: string;
     /** who triggered this run (for ⏹/⚙️ ownership gating) */
     requesterOpenId?: string;
@@ -4006,6 +4023,9 @@ export function createOrchestrator(
   ): Promise<void> {
     let activeKey = opts.knownThreadId ?? `pending:${opts.replyTo}`;
     let topicThreadId = opts.knownThreadId;
+    // The turn's workspace: resolves relative image refs in the reply and is what
+    // the session record stores (see LaunchOpts.cwd).
+    const runCwd = opts.cwd ?? fallbackCwd;
     // Reuse the reservation handleTurn made for this session (so messages
     // queued during startup aren't lost); fall back to a fresh state otherwise.
     const state: ActiveState = active.get(activeKey) ?? { queue: [], requesterOpenId: opts.requesterOpenId };
@@ -4079,7 +4099,7 @@ export function createOrchestrator(
       await upsertSession({
         threadId,
         chatId: opts.chatId,
-        cwd: opts.cwd ?? fallbackCwd,
+        cwd: runCwd,
         sessionId: opts.thread.sessionId,
         backend: opts.backendId ?? DEFAULT_BACKEND_ID,
         titleJobKey: opts.titleJobKey,
@@ -4188,6 +4208,12 @@ export function createOrchestrator(
         // CardKit streaming entity: body streams with the native typewriter,
         // ⏹/⚙️ ride whole-card updates — both on one card_id (see RunCardStream).
         const stream = queuedCard?.stream ?? new RunCardStream();
+        attachRunImages({
+          stream,
+          rc,
+          channel,
+          upload: (sources) => uploadOutboundImages(channel, sources, runCwd, opts.mode ?? DEFAULT_PERMISSION_MODE),
+        });
         const tCreate = Date.now();
         try {
           if (queuedCard) {
@@ -4371,18 +4397,19 @@ export function createOrchestrator(
           await adoptThreadId(finalMsgId);
           rc.cardKey = finalMsgId;
 
-          // Outbound images + 卡片围栏 — only at terminal (uploads are slow; while
-          // streaming, ![](path) refs and ```feishu-card fences show as text). Scan
-          // the final answer once: upload every image ref (cached; covers both the
-          // run-card's inline images and any clean-card images), then post each
-          // ```feishu-card fence as a standalone clean card. Best-effort: a failed
-          // upload leaves the original markdown in place, a failed card is logged.
+          // Outbound images + 卡片围栏. The answer's images mostly uploaded already
+          // (the background uploader started on the ref's first appearance, so the
+          // live card showed them mid-stream). settleImages finishes the job under
+          // ONE hard deadline — it waits out in-flight uploads and uploads the
+          // final answer's own refs concurrently, and what hasn't landed by then
+          // simply renders as text (an `image.create` with no timeout used to leave
+          // the card stuck on 「正在输出」with a live ⏹; issue #14 "一显示就卡").
+          // The ```feishu-card fences are hoisted into standalone clean cards here.
+          // Best-effort throughout: an unresolved ref renders as text, a failed
+          // card is logged.
           const answerText = finalMessageText(rc.rs);
           const { fences } = extractCardFences(answerText);
-          const imgSources = imageSources(answerText);
-          if (imgSources.length > 0) {
-            rc.images = await uploadOutboundImages(channel, imgSources, opts.cwd ?? fallbackCwd);
-          }
+          rc.images = await stream.settleImages(answerText);
 
           // terminal whole-card update: final render with streaming off (clears the
           // typewriter cursor) and no ⏹ button. Remove the callback before freezing
@@ -4526,6 +4553,8 @@ export function createOrchestrator(
     const objective = opts.firstText;
     let activeKey = opts.knownThreadId ?? `pending:${opts.replyTo}`;
     let topicThreadId = opts.knownThreadId;
+    // The goal's workspace — see LaunchOpts.cwd / launchRun's runCwd.
+    const runCwd = opts.cwd ?? fallbackCwd;
     const state: ActiveState = active.get(activeKey) ?? { queue: [], requesterOpenId: opts.requesterOpenId };
     state.thread = opts.thread;
     state.isGoal = true; // messages during the goal get a prompt, never queue (handleTurn)
@@ -4597,7 +4626,7 @@ export function createOrchestrator(
       await upsertSession({
         threadId,
         chatId: opts.chatId,
-        cwd: opts.cwd ?? fallbackCwd,
+        cwd: runCwd,
         sessionId: opts.thread.sessionId,
         backend: opts.backendId ?? DEFAULT_BACKEND_ID,
         titleJobKey: opts.titleJobKey,
@@ -4658,6 +4687,7 @@ export function createOrchestrator(
       await ctx.stream.drain();
       ctx.render.finalize();
       ctx.rc.rs = ctx.render.snapshot();
+      ctx.rc.images = await ctx.stream.settleImages(finalMessageText(ctx.rc.rs));
       await ctx.stream.updateCard(channel, buildRunCard(ctx.rc));
       runsByCard.delete(ctx.cardMsgId);
       promoteCard(ctx.cardMsgId, ctx.rc);
@@ -4684,6 +4714,12 @@ export function createOrchestrator(
     const ensureCard = async (ctx: GoalTurnCtx): Promise<void> => {
       if (ctx.stream) return;
       const stream = new RunCardStream();
+      attachRunImages({
+        stream,
+        rc: ctx.rc,
+        channel,
+        upload: (sources) => uploadOutboundImages(channel, sources, runCwd, opts.mode ?? DEFAULT_PERMISSION_MODE),
+      });
       const cardMsgId = await stream.create(channel, opts.chatId, buildRunCard(ctx.rc), { replyTo, replyInThread });
       ctx.rc.cardKey = cardMsgId;
       ctx.stream = stream;

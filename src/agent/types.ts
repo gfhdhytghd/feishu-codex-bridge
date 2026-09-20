@@ -28,6 +28,12 @@ export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
  */
 export type PermissionMode = 'qa' | 'write' | 'full';
 
+/** What a turn runs as when no project policy resolved a mode: the middle tier —
+ * confined to the project folder, never the historical whole-machine `full`.
+ * Consumers that receive an OPTIONAL mode (a caller may not have a project yet)
+ * read this ONE constant instead of each carrying its own `?? 'write'`. */
+export const DEFAULT_PERMISSION_MODE: PermissionMode = 'write';
+
 export interface AgentInput {
   text?: string;
   /** absolute local paths of images the user sent — codex reads them directly as
