@@ -1,3 +1,5 @@
+import { UnsentRequestError } from '../src/agent/types';
+import { AppServerClient } from '../src/agent/codex-appserver/app-server-client';
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -202,4 +204,36 @@ describe.skipIf(process.platform === 'win32')('容量 1 预热池（M-2）', () 
 
     await Promise.allSettled([t1.close(), t2.close()]);
   });
+});
+
+it('bounds a missing RPC response without killing unrelated requests', async () => {
+  const { bin } = makeFakeCodex();
+  const client = new AppServerClient({ bin, cwd: '/tmp' });
+  try {
+    await client.connect();
+    const hanging = client.request('hang', {}, 30);
+    const timedOut = expect(hanging).rejects.toThrow('delivery unknown');
+    await expect(client.request('model/list', {})).resolves.toHaveProperty('data');
+    await timedOut;
+    expect((client as any).pending.size).toBe(0);
+    await expect(client.request('model/list', {}, 1000)).resolves.toHaveProperty('data');
+  } finally { await client.close(); }
+});
+
+it('classifies a locally closed request as definitely unsent', async () => {
+ const client = new AppServerClient({bin:'unused',cwd:'/tmp'});
+ await expect(client.request('turn/steer')).rejects.toBeInstanceOf(UnsentRequestError);
+});
+it('returning a notification iterator removes its pending read', async () => {
+ const {bin} = makeFakeCodex(); const client = new AppServerClient({bin,cwd:'/tmp'});
+ try {
+  await client.connect();
+  const abandoned = client.stream()[Symbol.asyncIterator]();
+  const read = abandoned.next(); await abandoned.return?.();
+  expect(await read).toMatchObject({done:true});
+  await client.request('emit');
+  const fresh = client.stream()[Symbol.asyncIterator]();
+  expect(await fresh.next()).toMatchObject({done:false,value:{method:'real/event'}});
+  await fresh.return?.();
+ } finally {await client.close();}
 });

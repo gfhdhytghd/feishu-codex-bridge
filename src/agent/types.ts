@@ -1,3 +1,6 @@
+/** Request rejected locally before any transport write: safe to resubmit. */
+export class UnsentRequestError extends Error {}
+
 /**
  * Backend-agnostic agent interface. The codex app-server implementation lives
  * in ./codex-appserver; this layer lets the bot orchestrator stay decoupled
@@ -216,6 +219,7 @@ export interface AgentThread {
    * reactivate when the thread is later resumed. Best-effort. */
   clearGoal(): Promise<void>;
   /** inject input into the in-flight turn (引导) */
+  readonly supportsSteer?: boolean;
   steer(input: AgentInput, expectedTurnId: string): Promise<void>;
   /** interrupt the in-flight turn (watchdog 中止) */
   abort(turnId: string): Promise<void>;
