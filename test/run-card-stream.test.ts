@@ -98,6 +98,27 @@ describe('RunCardStream.streamElement — streaming_mode recovery', () => {
 describe('RunCardStream.updateCard — 终局帧保障（M-4）', () => {
   afterEach(() => vi.useRealTimers());
 
+  it('serializes file-row updates with demotion and overlays the latest file state onto stale frames', async () => {
+    const ch = fakeChannel();
+    const elementUpdates: any[] = [];
+    ch.rawClient.cardkit.v1.cardElement.update = async (request: any) => { elementUpdates.push(request); return {}; };
+    const s = new RunCardStream();
+    const initial = card([{ tag: 'column_set', columns: [{ tag: 'column', elements: [
+      { tag: 'markdown', element_id: 'local_file_0', content: '获取并查看' },
+    ] }] }]);
+    await s.create(ch, 'oc_file_rows', initial, {});
+    expect(s.getCardId()).toBe('c_1');
+    const row = { tag: 'markdown', element_id: 'local_file_0', content: '查看文件' };
+    await Promise.all([
+      s.updateCard(ch, initial), // stale demotion was already queued
+      s.updateElement(ch, 'local_file_0', row),
+      s.updateCard(ch, initial),
+    ]);
+    expect(ch.updates.every((u: any) => u.data.includes('查看文件') && !u.data.includes('获取并查看'))).toBe(true);
+    expect(elementUpdates[0].data.sequence).toBeGreaterThan(ch.updates[0].sequence);
+    expect(ch.updates[1].sequence).toBeGreaterThan(elementUpdates[0].data.sequence);
+  });
+
   it('retries a rate-limited terminal update with exponential backoff until it lands', async () => {
     vi.useFakeTimers();
     // 两种限频形态都识别：HTTP 429（axios status）与业务码 99991400。

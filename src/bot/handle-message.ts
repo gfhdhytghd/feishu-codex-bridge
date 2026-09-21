@@ -172,6 +172,7 @@ import { serviceStdoutPath, serviceStderrPath } from '../service/common';
 import { bridgeVersion } from '../core/version';
 import { webConsoleUrl } from '../web/discovery';
 import { paths } from '../config/paths';
+import { OutboundFiles } from './outbound-files';
 import { getSecret } from '../config/keystore';
 import { buildScopeGrantUrl, JOIN_GROUP_SCOPES } from '../config/scopes';
 import { validateAppCredentials } from '../utils/feishu-auth';
@@ -2101,6 +2102,15 @@ export function createOrchestrator(
 
   // ── card actions ──────────────────────────────────────────────────
   const dispatcher = new CardDispatcher(channel, cfg);
+  const outboundFiles = new OutboundFiles(paths.outboundFilesDir);
+  void outboundFiles.recover(channel);
+  outboundFiles.register(dispatcher, async (record, openId) => {
+    if (!openId || !isChatAllowed(cfg, record.chatId)) return undefined;
+    const project = await getProjectByChatId(record.chatId);
+    if (!project || project.cwd !== record.cwd || !isUserAllowedInProject(cfg, project, openId)) return undefined;
+    if (openId !== record.requesterOpenId && !isAdmin(cfg, openId)) return undefined;
+    return turnTier(project, isAdmin(cfg, openId)).mode;
+  });
   cliBridge?.register(dispatcher);
   const PENDING_TTL_MS = 30 * 60_000; // abandoned config cards expire after 30 min
   // Goal runs have NO total wall-clock cap (a healthy goal may legitimately run
@@ -4429,6 +4439,11 @@ export function createOrchestrator(
           // Best-effort throughout: an unresolved ref renders as text, a failed
           // card is logged.
           const answerText = finalMessageText(rc.rs);
+          rc.localFiles = await outboundFiles.prepare(answerText, {
+            messageId: finalMsgId, chatId: opts.chatId, cwd: runCwd,
+            mode: opts.mode ?? DEFAULT_PERMISSION_MODE, requesterOpenId: currentTurn.requesterOpenId,
+            replyInThread: !opts.flat, cardId: stream.getCardId(),
+          }, (elementId, element) => stream.updateElement(channel, elementId, element));
           const { fences } = extractCardFences(answerText);
           rc.images = await stream.settleImages(answerText);
 
@@ -4708,7 +4723,13 @@ export function createOrchestrator(
       await ctx.stream.drain();
       ctx.render.finalize();
       ctx.rc.rs = ctx.render.snapshot();
-      ctx.rc.images = await ctx.stream.settleImages(finalMessageText(ctx.rc.rs));
+      const answerText = finalMessageText(ctx.rc.rs);
+      ctx.rc.localFiles = await outboundFiles.prepare(answerText, {
+        messageId: ctx.cardMsgId, chatId: opts.chatId, cwd: runCwd,
+        mode: opts.mode ?? DEFAULT_PERMISSION_MODE, requesterOpenId: opts.requesterOpenId,
+        replyInThread: !opts.flat, cardId: ctx.stream.getCardId(),
+      }, (elementId, element) => ctx.stream!.updateElement(channel, elementId, element));
+      ctx.rc.images = await ctx.stream.settleImages(answerText);
       await ctx.stream.updateCard(channel, buildRunCard(ctx.rc));
       runsByCard.delete(ctx.cardMsgId);
       promoteCard(ctx.cardMsgId, ctx.rc);

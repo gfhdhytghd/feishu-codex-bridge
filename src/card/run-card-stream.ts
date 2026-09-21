@@ -1,6 +1,6 @@
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { log } from '../core/logger';
-import type { CardObject } from './cards';
+import type { CardObject, CardElement } from './cards';
 import { isCardIdNotReady } from './managed';
 import type { StreamingImages } from './outbound-images';
 
@@ -409,6 +409,35 @@ export class RunCardStream {
     return this.enqueueForcedUpdate(channel, fullCard);
   }
 
+  getCardId(): string { return this.cardId; }
+
+  /** File rows share the whole-card queue and sequence, including demotion. */
+  private readonly elementOverrides = new Map<string, CardElement>();
+
+  updateElement(channel: LarkChannel, elementId: string, element: CardElement): Promise<boolean> {
+    this.elementOverrides.set(elementId, element);
+    const data = JSON.stringify(element);
+    const task = this.forcedUpdateTail.then(async () => {
+      if (!this.cardId) return false;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await this.pacer?.wait();
+        try {
+          assertCardkitSuccess(await channel.rawClient.cardkit.v1.cardElement.update({
+            path: { card_id: this.cardId, element_id: elementId },
+            data: { element: data, sequence: ++this.seq, uuid: `f_${this.cardId}_${this.seq}` },
+          }));
+          return true;
+        } catch (err) {
+          log.fail('card', err, { phase: 'file-row-update', retry: attempt === 0 });
+          if (attempt === 0) await new Promise((r) => setTimeout(r, 3200));
+        }
+      }
+      return false;
+    });
+    this.forcedUpdateTail = task.then(() => undefined, () => undefined);
+    return task;
+  }
+
   /**
    * Repaint a still-live card (currently used by the completion-reminder
    * control). Once {@link finalizeCard} has synchronously frozen live repaints,
@@ -436,7 +465,20 @@ export class RunCardStream {
     // Capture the exact frame at invocation time; callers often mutate their
     // RunCardState again while this queued network write is waiting its turn.
     const data = JSON.stringify(fullCard);
-    const task = this.forcedUpdateTail.then(() => this.pushForcedUpdate(channel, data));
+    const task = this.forcedUpdateTail.then(() => {
+      // Overlay at dispatch time: an already-queued demotion must not restore
+      // a stale "get" button after delivery completed.
+      const frame = JSON.parse(data) as CardBody;
+      const overlay = (el: CardElement): CardElement => {
+        const updated = this.elementOverrides.get(String(el.element_id));
+        if (updated) return updated;
+        if (Array.isArray(el.elements)) el.elements = (el.elements as CardElement[]).map(overlay);
+        if (Array.isArray(el.columns)) el.columns = (el.columns as CardElement[]).map(overlay);
+        return el;
+      };
+      if (frame.body?.elements) frame.body.elements = frame.body.elements.map(overlay);
+      return this.pushForcedUpdate(channel, JSON.stringify(frame));
+    });
     // A surprising transport failure must not poison the serialization tail and
     // prevent the terminal frame. pushForcedUpdate normally absorbs failures,
     // but keep the tail resilient to any future exception too.

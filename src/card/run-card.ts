@@ -22,6 +22,7 @@ import {
 } from './run-state';
 import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import { renderRichText } from './markdown-render';
+import { fileComponentCount, renderFileAnswer, type InlineFiles } from './inline-files';
 import { hasMarkdownTable, renderReport } from './report-render';
 import { StreamingImages } from './outbound-images';
 import type { RunCardStream } from './run-card-stream';
@@ -129,6 +130,8 @@ export interface RunCardState {
    * the terminal card shows every image that made it. An unresolved ref renders
    * as text, never as raw `![](…)` markdown (see {@link renderRichText}). */
   images?: ReadonlyMap<string, string>;
+  /** Prepared at terminal, before rendering can discard local link targets. */
+  localFiles?: InlineFiles;
 }
 
 /**
@@ -306,14 +309,18 @@ function renderTerminal(state: RunState, rc: RunCardState): CardElement[] {
   const elements: CardElement[] = [];
 
   const answerIdx = lastTextIndex(state.blocks);
-  const answer = answerIdx >= 0 ? (state.blocks[answerIdx] as Extract<Block, { kind: 'text' }>).content.trim() : '';
+  const answer = rc.localFiles?.text ?? (answerIdx >= 0 ? (state.blocks[answerIdx] as Extract<Block, { kind: 'text' }>).content.trim() : '');
+  const answerElements = rc.localFiles ? renderFileAnswer(rc.localFiles, rc.images)
+    : hasMarkdownTable(answer) ? renderReport(answer, { images: rc.images }) : renderRichText(answer, rc.images);
 
   // Everything except the final answer block is "process". (A block after the
   // answer can only be a trailing tool call — keep it folded with the rest.)
   const processBlocks = state.blocks.filter((_, i) => i !== answerIdx);
   const blocks = rc.showTools === false ? processBlocks.filter((b) => b.kind !== 'tool') : processBlocks;
   const reasoning = reasoningContent(state);
-  const processEls = buildProcessBody(reasoning, blocks, rc.images);
+  const processBudget = rc.localFiles?.links.length
+    ? Math.max(10, Math.min(PROCESS_COMPONENT_BUDGET, 170 - fileComponentCount(answerElements))) : PROCESS_COMPONENT_BUDGET;
+  const processEls = buildProcessBody(reasoning, blocks, rc.images, processBudget);
   if (processEls.length > 0) {
     const toolCount = blocks.reduce((n, b) => (b.kind === 'tool' ? n + 1 : n), 0);
     elements.push(
@@ -335,9 +342,7 @@ function renderTerminal(state: RunState, rc: RunCardState): CardElement[] {
   // project, missing/oversized file, failed upload) renders as text — never raw
   // `![](…)`, which the client would resolve as a broken image node.
   if (answer) {
-    elements.push(
-      ...(hasMarkdownTable(answer) ? renderReport(answer, { images: rc.images }) : renderRichText(answer, rc.images)),
-    );
+    elements.push(...answerElements);
   }
 
   if (state.terminal === 'interrupted') {
@@ -412,9 +417,9 @@ export function runningAnswerText(state: RunState): string {
  * (with tool-output bodies) exceeds {@link PROCESS_BODY_BUDGET}, rebuild it with
  * every tool group degraded to a header-only summary.
  */
-function buildProcessBody(reasoning: string, blocks: Block[], images?: ReadonlyMap<string, string>): CardElement[] {
+function buildProcessBody(reasoning: string, blocks: Block[], images?: ReadonlyMap<string, string>, componentBudget = PROCESS_COMPONENT_BUDGET): CardElement[] {
   const rich = processElements(reasoning, blocks, false, images);
-  if (estimateSize(rich) <= PROCESS_BODY_BUDGET && estimateComponents(rich) <= PROCESS_COMPONENT_BUDGET) {
+  if (estimateSize(rich) <= PROCESS_BODY_BUDGET && estimateComponents(rich) <= componentBudget) {
     return rich;
   }
   return processElements(reasoning, blocks, true, images);

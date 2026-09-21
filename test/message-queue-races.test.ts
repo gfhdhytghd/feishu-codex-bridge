@@ -30,6 +30,8 @@ vi.mock('../src/bot/session-title-coordinator', () => ({
 vi.mock('../src/card/run-card-stream', () => ({
   RunCardStream: class {
     create = fake.createCard;
+    getCardId() { return 'card_entity'; }
+    async updateElement() { return true; }
     streamCoalesced() {}
     async drain() {}
     setImageWorker() {}
