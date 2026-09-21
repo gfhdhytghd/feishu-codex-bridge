@@ -1437,6 +1437,21 @@ export function createOrchestrator(
         let thread = resolved;
         let titleJobKey: string | undefined;
         const neverSeen = !thread;
+        let model = prior?.model;
+        let effort = prior?.effort;
+        // Match new-topic initialization for single-session groups. Older flat
+        // sessions may also lack these fields; bind the next ordinary turn to
+        // explicit defaults so the card describes what we actually request.
+        if (!thread || (flat && !goal && !model)) {
+          const be = backendFor(prior?.backend ?? project?.backend);
+          const defaults = pickDefault(await listModels(be), {
+            model: project?.defaultModel,
+            effort: project?.defaultEffort,
+          });
+          model ??= defaults.model;
+          effort ??= defaults.effort;
+          if (prior) await patchSession(sessionKey, { model, effort });
+        }
         // codex's history is EMPTY when the session is brand-new (neverSeen) OR a
         // resume failed and we fell back to a new thread (recreated) — both want
         // the FULL topic woven as opening context, not just the delta.
@@ -1446,7 +1461,7 @@ export function createOrchestrator(
           // a fresh session bound to the resolved cwd, on the project's backend.
           const cwd = project?.cwd ?? fallbackCwd;
           const be = backendFor(project?.backend);
-          thread = await be.startThread({ cwd, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
+          thread = await be.startThread({ cwd, model, effort, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
           trackSession(sessionKey, thread);
           // 自愈观测：来源=全新会话（无持久化记录），与 resume-ok/resume-recreate
           // 互斥——三者其一 + agent 层的 spawn/prewarm-hit 即可还原完整恢复路径。
@@ -1459,6 +1474,8 @@ export function createOrchestrator(
             sessionId: thread.sessionId,
             backend: be.id,
             titleJobKey,
+            model,
+            effort,
             // `text` is already file-woven when preIngested; use the raw
             // `summaryText` (handleTurn's original) so the session label isn't
             // manifest boilerplate + a temp path.
@@ -1479,6 +1496,8 @@ export function createOrchestrator(
           if (prior) {
             await upsertSession({
               ...prior,
+              model,
+              effort,
               cwd,
               sessionId: thread.sessionId,
               backend: be.id,
@@ -1528,6 +1547,8 @@ export function createOrchestrator(
           replyInThread: !flat,
           flat,
           thread,
+          model,
+          effort,
           firstText,
           images,
           knownThreadId: sessionKey,
@@ -1543,7 +1564,7 @@ export function createOrchestrator(
           requesterOpenId: msg.senderId,
           requestedAt: msg.createTime || tIntake,
           // 编织完成 → turn/start 之间不再读盘：首轮直接用预取的会话记录
-          // （prior=undefined 即确知是全新会话，刚 upsert 的记录还没有 model）。
+          // （新会话及旧单会话的缺失值由上面的 model/effort 补齐）。
           firstRec: prior ?? null,
           titleJobKey,
           titleSource,
