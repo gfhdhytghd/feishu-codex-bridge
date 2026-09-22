@@ -1,3 +1,7 @@
+import { registerVoiceConsole } from './voice-console';
+import { createVoiceService } from '../voice/service';
+import { ingestVoice, createIntakeQueue, type IngestedContext } from '../voice/inbound';
+import type { VoiceReply } from '../voice/types';
 import { steerWithDeadline, isRejectedSteer } from './steer-delivery';
 import type {
   BotAddedEvent,
@@ -408,6 +412,7 @@ export { BACKEND_PROBE_TIMEOUT_MS, probeBackends, validateBackendSwitch } from '
  * requester and enqueue clock travel with the input so completion @ mentions,
  * manual-reminder ownership and long-task timing never leak from turn one. */
 export interface QueuedTurn {
+  voice?: VoiceReply;
   input: AgentInput;
   /** Un-woven SDK message source used only if this becomes the first accepted
    * host turn. Never recover a title from AgentInput.text. */
@@ -464,6 +469,10 @@ function runFailureMessage(err: unknown, dropped: number): string {
 }
 
 interface ActiveState {
+  /** Captured with the steer target so a late ACK cannot decorate another turn. */
+  voiceReply?: { run: AgentRun; add: (voice: VoiceReply) => void };
+  /** Prevent a late ASR result from restarting a stopped conversation. */
+  intakeCancelled?: boolean;
   /** unset only during the brief "reserved, still resolving the thread" window */
   thread?: AgentThread;
   run?: AgentRun;
@@ -780,6 +789,9 @@ export function createOrchestrator(
   // reads the latest committed LIVE snapshot, persists its own next snapshot,
   // then commits it to LIVE — concurrent clicks cannot erase one another.
   const writePreferences = createAppPreferencesWriter({ cfg });
+  const voice = createVoiceService(cfg, writePreferences);
+  const orderContext = createIntakeQueue();
+  const orderTurns = createIntakeQueue();
   // pendingPolicy is read per-message (settings card can change it live)
   /** pending /resume cards, keyed by the card's messageId */
   const resumePending = new Map<string, ResumeCardState>();
@@ -1003,7 +1015,7 @@ export function createOrchestrator(
         startReservedRun(msg, goalObjective, ts.sessionKey, true, project, ts, undefined, undefined, undefined, true);
         return;
       }
-      handleTurn(msg, text, ts.sessionKey, true, project, ts);
+      void handleTurn(msg, text, ts.sessionKey, true, project, ts).catch((err) => log.fail('intake', err));
       return;
     }
 
@@ -1053,7 +1065,7 @@ export function createOrchestrator(
         startReservedRun(msg, goalObjective, ts.sessionKey, false, project, ts, undefined, undefined, undefined, true);
         return;
       }
-      handleTurn(msg, text, ts.sessionKey, false, project, ts);
+      void handleTurn(msg, text, ts.sessionKey, false, project, ts).catch((err) => log.fail('intake', err));
       return;
     }
     // Main group area: /resume opens the history picker; /settings opens the
@@ -1206,11 +1218,15 @@ export function createOrchestrator(
    *     skipped, never thrown.
    * Both are gated (messageHasFiles / replyToMessageId) so the common text path
    * stays await-free. 话题上文 is woven separately in startReservedRun (it is
-   * session-scoped, not per-message). Returns `text` unchanged when there's
-   * nothing to add.
+   * session-scoped, not per-message). Voice display metadata stays separate
+   * from the woven agent input.
    */
-  async function ingestContext(msg: NormalizedMessage, text: string): Promise<string> {
-    let body = text;
+  function ingestContext(msg: NormalizedMessage, text: string): Promise<IngestedContext> {
+    return orderContext(msg.threadId ?? msg.chatId, () => ingestContextImpl(msg, text));
+  }
+  async function ingestContextImpl(msg: NormalizedMessage, text: string): Promise<IngestedContext> {
+    const ingested = msg.rawContentType === 'audio' ? await ingestVoice(channel, msg, voice) : { text };
+    let body = ingested.text;
     if (messageHasFiles(msg)) {
       const files = await collectInboundFiles(channel, msg);
       body = weaveFileManifest(text, files);
@@ -1230,7 +1246,7 @@ export function createOrchestrator(
     // codex can match the roster (approve-gate) and @ them back. Covers both the
     // first-turn (startReservedRun) and mid-turn (handleTurn) paths.
     body = weaveSender(body, msg);
-    return body;
+    return { ...ingested, text: body };
   }
 
   /**
@@ -1238,7 +1254,18 @@ export function createOrchestrator(
    * the chatId (single, `flat`). steer/queue mid-turn; otherwise reserve + run.
    * `flat` = reply by quoting (no reply_in_thread / topic), for single groups.
    */
-  async function handleTurn(
+  function handleTurn(msg: NormalizedMessage, text: string, sessionKey: string, flat: boolean, project: Project | undefined, perm: TurnPerm): Promise<void> {
+    const owner = active.get(sessionKey);
+    return orderTurns(sessionKey, async () => {
+      if (owner?.intakeCancelled) {
+        await channel.send(msg.chatId, { markdown: '排队期间会话已停止，请重发本条消息。' }, { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
+        return;
+      }
+      await prepareTurn(msg, text, sessionKey, flat, project, perm);
+    });
+  }
+
+  async function prepareTurn(
     msg: NormalizedMessage,
     text: string,
     sessionKey: string,
@@ -1259,15 +1286,19 @@ export function createOrchestrator(
       // carry them. Awaited here — the session is already held by a running
       // turn, so there's no reservation race to protect; gated on
       // messageHasImages so the common text path stays await-free and fast.
-      const images = messageHasImages(msg) ? await collectInboundImages(channel, msg) : undefined;
-      // Download file attachments too and weave their paths into the text (codex
-      // reads them by path). Both awaits happen before re-reading the session.
-      const woven = await ingestContext(msg, text);
+      const [images, woven] = await Promise.all([
+        messageHasImages(msg) ? collectInboundImages(channel, msg) : Promise.resolve(undefined),
+        ingestContext(msg, text),
+      ]);
+      if (existing.intakeCancelled) {
+        await channel.send(msg.chatId, { markdown: '本条消息处理期间会话已停止，请重发。' }, { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
+        return;
+      }
       // The turn may have finished while media downloaded — re-read the session.
       // If it's gone, start a fresh run (carrying what we already fetched).
       const cur = active.get(sessionKey);
       if (!cur) {
-        startReservedRun(msg, woven, sessionKey, flat, project, perm, images, true, text);
+        startReservedRun(msg, woven.text, sessionKey, flat, project, perm, images, woven, text);
         return;
       }
       // A goal may have started while media downloaded — same prompt as above.
@@ -1275,37 +1306,50 @@ export function createOrchestrator(
         await replyGoalBusy(msg, flat);
         return;
       }
-      if (getPendingPolicy(cfg) === 'steer' && cur.run && cur.thread && cur.thread.supportsSteer !== false) {
-        const tid = cur.run.turnId();
-        if (tid) {
-          try {
-            await steerWithDeadline(cur.thread, { text: woven, images }, tid);
-            log.info('intake', 'steer', { tid, images: images?.length ?? 0 });
-            return;
-          } catch (err) {
-            log.warn('intake', 'steer-failed', { err: String(err) });
-            if (!isRejectedSteer(err)) {
-              void channel.send(msg.chatId,
-                { markdown: '⚠️ 本条消息的接收确认失败，可能已进入模型。为避免重复执行，未自动重投；请先核对本轮结果。' },
-                { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
-              return;
-            }
-          }
-        }
-      }
-      // steer() awaited an RPC: the previous run may have ended, or a new
-      // run/goal may now own this key. Re-enter the synchronous reservation
-      // path so the input is queued on the current owner or starts a new run.
-      // A pre-write rejection can race a dead consumer's terminal cleanup.
-      if (cur.thread && !cur.thread.isAlive() && active.get(sessionKey) === cur) {
-        active.delete(sessionKey);
-        if (sessions.get(sessionKey) === cur.thread) sessions.delete(sessionKey);
-      }
-      startReservedRun(msg, woven, sessionKey, flat, project, perm, images, true, text);
+      void deliverPreparedTurn(msg, woven, images, text, sessionKey, flat, project, perm, cur)
+        .catch((err) => log.fail('intake', err));
       return;
     }
 
     startReservedRun(msg, text, sessionKey, flat, project, perm);
+  }
+
+  // Keep preparation ordered, but do not pin the lane on an uncertain steer ACK.
+  // Explicit stale-turn rejection may still requeue onto a replacement owner.
+  async function deliverPreparedTurn(
+    msg: NormalizedMessage, woven: IngestedContext, images: string[] | undefined, text: string,
+    sessionKey: string, flat: boolean, project: Project | undefined, perm: TurnPerm, cur: ActiveState,
+  ): Promise<void> {
+    if (getPendingPolicy(cfg) === 'steer' && cur.run && cur.thread && cur.thread.supportsSteer !== false) {
+      const tid = cur.run.turnId();
+      if (tid) {
+        const voiceReply = cur.voiceReply?.run === cur.run ? cur.voiceReply : undefined;
+        try {
+          await steerWithDeadline(cur.thread, { text: woven.text, images }, tid);
+          if (woven.voice) voiceReply?.add(woven.voice);
+          log.info('intake', 'steer', { tid, images: images?.length ?? 0 });
+          return;
+        } catch (err) {
+          log.warn('intake', 'steer-failed', { err: String(err) });
+          if (!isRejectedSteer(err)) {
+            void channel.send(msg.chatId,
+              { markdown: '⚠️ 本条消息的接收确认失败，可能已进入模型。为避免重复执行，未自动重投；请先核对本轮结果。' },
+              { replyTo: msg.messageId, replyInThread: !flat }).catch(() => undefined);
+            return;
+          }
+        }
+      }
+    }
+    if (cur.intakeCancelled) return;
+    // steer() awaited an RPC: the previous run may have ended, or a new
+    // run/goal may now own this key. Re-enter the synchronous reservation
+    // path so the input is queued on the current owner or starts a new run.
+    // A pre-write rejection can race a dead consumer's terminal cleanup.
+    if (cur.thread && !cur.thread.isAlive() && active.get(sessionKey) === cur) {
+      active.delete(sessionKey);
+      if (sessions.get(sessionKey) === cur.thread) sessions.delete(sessionKey);
+    }
+    startReservedRun(msg, woven.text, sessionKey, flat, project, perm, images, woven, text);
   }
 
   /** 🎯 goal 运行中收到消息的统一提示（goal 会话不入队，见 ActiveState.isGoal）。 */
@@ -1338,7 +1382,7 @@ export function createOrchestrator(
     project: Project | undefined,
     perm: TurnPerm,
     preloadedImages?: string[],
-    preIngested?: boolean,
+    preIngested?: IngestedContext,
     summaryText?: string,
     goal?: boolean,
   ): void {
@@ -1369,6 +1413,7 @@ export function createOrchestrator(
       // already file-woven when preIngested (handleTurn's fall-through).
       existing.queue.push({
         input: { text, images: preloadedImages },
+        voice: preIngested?.voice,
         titleSource,
         requesterOpenId: msg.senderId,
         requestedAt: msg.createTime || Date.now(),
@@ -1400,7 +1445,7 @@ export function createOrchestrator(
             : Promise.resolve(undefined);
         // File attachments / quoted message woven into the prompt. Skipped when
         // preIngested (handleTurn already wove them into `text`).
-        const ingestP = preIngested ? Promise.resolve(text) : ingestContext(msg, text);
+        const ingestP = preIngested ? Promise.resolve(preIngested) : ingestContext(msg, text);
         let tResolveDone = tIntake;
         const resolveP = resolveThread(sessionKey, msg.chatId, {
           mode: perm.mode,
@@ -1434,7 +1479,7 @@ export function createOrchestrator(
           priorP,
           historyP,
         ]);
-        let firstText = ingested;
+        let firstText = ingested.text;
         let thread = resolved;
         let titleJobKey: string | undefined;
         const neverSeen = !thread;
@@ -1551,6 +1596,7 @@ export function createOrchestrator(
           model,
           effort,
           firstText,
+          voice: ingested.voice,
           images,
           knownThreadId: sessionKey,
           // The run's cwd: the project directory the agent works in. MUST be
@@ -1726,11 +1772,13 @@ export function createOrchestrator(
       let effort: ReasoningEffort;
       let images: string[] | undefined;
       let firstText: string;
+      let voiceReply: VoiceReply | undefined;
       try {
         const [started, imgs, ingested] = await Promise.all([threadP, imagesP, ingestP]);
         ({ thread, model, effort } = started);
         images = imgs;
-        firstText = ingested || '你好，我们开始吧。';
+        firstText = ingested.text || '你好，我们开始吧。';
+        voiceReply = ingested.voice;
       } catch (err) {
         reaction?.done();
         // 失败路互不拖死：threadP 若已成功则回收孤儿进程，若失败吞掉其 rejection。
@@ -1749,6 +1797,7 @@ export function createOrchestrator(
         replyInThread: true,
         thread,
         firstText,
+        voice: voiceReply,
         images,
         model,
         effort,
@@ -2812,6 +2861,8 @@ export function createOrchestrator(
     };
   };
 
+  const voiceConsole = registerVoiceConsole(dispatcher, channel, cfg, voice);
+
   dispatcher
     .on(DM.menu, ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) freshMenu(evt);
@@ -2906,6 +2957,7 @@ export function createOrchestrator(
     })
     .on(DM.settings, async ({ evt }) => {
       if (dmAdmin(evt.operator?.openId)) {
+        voiceConsole.leave(evt.messageId);
         await patch(evt, renderSettings);
       }
     })
@@ -3919,6 +3971,7 @@ export function createOrchestrator(
   }
 
   interface LaunchOpts {
+    voice?: VoiceReply;
     chatId: string;
     replyTo: string;
     /** true on first reply that creates the topic; subsequent replies use replyTo only */
@@ -3995,6 +4048,7 @@ export function createOrchestrator(
     const queueCard = (input: Parameters<typeof buildQueuedCard>[0]) =>
       buildQueuedCard({
         ...input,
+        voiceMessages: opts.voice ? [opts.voice] : undefined,
         ...(!state.isGoal ? { completionReminder: completionReminderView(state) } : {}),
       });
     const q = sema.enqueue((pos) => {
@@ -4028,6 +4082,7 @@ export function createOrchestrator(
     // 让位给运行期 interrupt（launchRun 每轮重装）。
     state.interrupt = () => {
       if (!q.cancel()) return;
+      state.intakeCancelled = true;
       active.delete(activeKey);
       if (opts.knownThreadId) sessions.delete(opts.knownThreadId);
       // 还没跑过任何 turn：直接回收进程。持久化记录保留，重发消息经 resume 兜底。
@@ -4167,6 +4222,7 @@ export function createOrchestrator(
     try {
       let currentTurn: QueuedTurn = {
         input: { text: opts.firstText, images: opts.images },
+        voice: opts.voice,
         titleSource: opts.titleSource,
         requesterOpenId: opts.requesterOpenId,
         requestedAt: opts.requestedAt ?? Date.now(),
@@ -4204,6 +4260,7 @@ export function createOrchestrator(
         let cardMsgId: string | undefined;
         const rc: RunCardState = {
           rs: render.snapshot(),
+          voiceMessages: currentTurn.voice ? [currentTurn.voice] : [],
           requesterOpenId: currentTurn.requesterOpenId,
           showTools: render.showTools,
           completionReminder: completionReminderView(state),
@@ -4239,6 +4296,18 @@ export function createOrchestrator(
         // CardKit streaming entity: body streams with the native typewriter,
         // ⏹/⚙️ ride whole-card updates — both on one card_id (see RunCardStream).
         const stream = queuedCard?.stream ?? new RunCardStream();
+        state.voiceReply = {
+          run,
+          add: (voice) => {
+            const messages = (rc.voiceMessages ??= []);
+            if (messages.some((v) => v.messageId === voice.messageId)) return;
+            messages.push(voice);
+            if (!cardMsgId) return; // The post-create frame picks it up below.
+            if (rc.rs.terminal === 'running') stream.streamCoalesced(channel, buildRunCard(rc), ANSWER_EID);
+            else void stream.updateCard(channel, buildRunCard(rc))
+              .catch((err) => log.fail('card', err, { phase: 'voice-steer-reply' }));
+          },
+        };
         attachRunImages({
           stream,
           rc,
@@ -4315,7 +4384,7 @@ export function createOrchestrator(
           forceStop: resolveStop,
         });
         disposeInterrupt = stopper.dispose;
-        state.interrupt = stopper.interrupt;
+        state.interrupt = () => { state.intakeCancelled = true; stopper.interrupt(); };
         const idleMs = currentIdleMs();
         const guarded = withIdleTimeout(
           run.events,
@@ -4517,6 +4586,7 @@ export function createOrchestrator(
         // swallowing them. 优雅 ⏹ 虽然线程留用，但用户按了停就是要停：排队消息
         // 同样丢弃（语义与杀进程路径一致，只是进程不回收）。
         if (killed || procDead || interrupted) {
+          state.intakeCancelled = true;
           if (state.queue.length > 0) {
             void channel
               .send(
@@ -4555,6 +4625,7 @@ export function createOrchestrator(
       // A replacement run may have reserved the key while failure feedback
       // was in flight. Never delete another run's reservation.
       if (active.get(activeKey) === state) active.delete(activeKey);
+      state.voiceReply = undefined;
       if (curCardKey) {
         runsByCard.delete(curCardKey);
         completionReminderRefreshers.delete(curCardKey);
@@ -5471,7 +5542,7 @@ export function createOrchestrator(
   // 管理面写执行器（Web 控制台 / supervisor IPC 入口）：与上面 DM 回调共用
   // admin/ops.ts 的 perform*，注入同一个 backendFor + evictLiveSessionsForChat
   // —— 双端写行为同源（同校验、同落盘、同驱逐）。
-  const executeAdminWrite = createAdminWriteExecutor({ cfg, backendFor, evictLiveSessionsForChat, writePreferences });
+  const executeAdminWrite = createAdminWriteExecutor({ cfg, backendFor, evictLiveSessionsForChat, writePreferences, voiceAction: voice.action });
   const adminExecute = async (op: AdminWriteOp): Promise<void> => {
     await executeAdminWrite(op);
     if (op.kind === 'setCompletionReminder') refreshCompletionReminderCards();

@@ -257,3 +257,20 @@ describe('per-chat 推送共享限速（M-4）', () => {
     expect(ch.updates[1].at - ch.updates[0].at).toBe(0); // 各自的桶，互不排队
   });
 });
+
+it('streams only answer growth while preserving the native voice panel', async () => {
+  const { voiceReplyElements } = await import('../src/card/voice-reply');
+  const voice = { messageId: 'voice', text: '较长语音原文。'.repeat(100), transcribed: true };
+  const voiceFrame = (answer: string) => card([...voiceReplyElements([voice]), mdStream(answer, 'answer')], { streaming: true });
+  const ch = fakeChannel();
+  const stream = new RunCardStream();
+  await stream.create(ch, 'voice-stream-chat', voiceFrame('开始'), {});
+  stream.streamCoalesced(ch, voiceFrame('开始'), 'answer');
+  await stream.drain();
+  const before = ch.updates.length;
+  stream.streamCoalesced(ch, voiceFrame('开始，下面是很长的回答。'.repeat(100)), 'answer');
+  await stream.drain();
+  expect(ch.updates).toHaveLength(before);
+  expect(ch.contents).toHaveLength(1);
+  expect(ch.contents[0].content).not.toContain('语音');
+});

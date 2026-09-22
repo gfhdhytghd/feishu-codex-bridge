@@ -191,3 +191,17 @@ npm test            # vitest
 ## 📄 License
 
 [MIT](LICENSE) © modelzen
+
+### 语音转文字
+
+给 agent 发语音时，先转为文字再发送给 agent。
+
+网页控制台：选择机器人 → **语音转文字**。飞书私聊控制台：**设置 → 语音转文字 → 去开启 / 去关闭**。
+
+- 开关：开启后自动检查权限，缺少权限时显示 **去授权** 和 **重新检测**；授权并发布应用后，点击重新检测即可刷新权限状态，不上传音频。
+- 测试：仅在开启后显示，用内置短音频验证转写并显示结果。
+- 若机器人所属租户为飞书免费版，则不支持调用。[飞书 ASR 文档](https://open.feishu.cn/document/server-docs/ai/speech_to_text-v1/file_recognize?lang=zh-CN)
+
+设置即时生效。识别不可用时保留原语音附件交给 agent。agent 接收转写原文，不附加复述要求。
+bridge 在回复卡片顶部添加默认展开、可收起的浅灰“语音消息”原文块，流式和最终回复均保留；结果不保证与飞书客户端一致。支持 60 秒、20 MB 以内的纯语音。
+Windows/macOS 无需额外安装 ffmpeg 或 Python。

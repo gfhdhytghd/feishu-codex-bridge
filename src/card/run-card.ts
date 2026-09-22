@@ -1,3 +1,5 @@
+import type { VoiceReply } from '../voice/types';
+import { voiceReplyElements } from './voice-reply';
 import {
   actions,
   button,
@@ -92,6 +94,8 @@ const SUMMARY_BODY_MAX = 6000;
 /** Routing + render inputs for one run card. */
 export interface RunCardState {
   rs: RunState;
+  /** Independent of model text, preserved across live and terminal renders. */
+  voiceMessages?: VoiceReply[];
   /** identity for ⏹ stop routing (the card's own messageId) */
   cardKey?: string;
   /** topic thread id (known after the topic is created) */
@@ -195,7 +199,7 @@ export function buildRunCard(rc: RunCardState): CardObject {
   const state = rc.rs;
   const running = state.terminal === 'running';
   const elements = running ? renderRunning(state, rc) : renderTerminal(state, rc);
-  return card(elements, { streaming: running, summary: summaryText(state) });
+  return card([...voiceReplyElements(rc.voiceMessages), ...elements], { streaming: running, summary: summaryText(state) });
 }
 
 /**
@@ -493,6 +497,7 @@ export function buildRunCardPlain(rc: RunCardState): CardObject {
 
 /** Render inputs for the queue placeholder card (M-3 排队可见可取消). */
 export interface QueuedCardState {
+  voiceMessages?: VoiceReply[];
   /** 1-based position in the global run queue (waiting layout only). */
   position?: number;
   /** routes the ⏹ 取消 button (the card's own messageId); unset → no button
@@ -520,12 +525,13 @@ export interface QueuedCardState {
  */
 export function buildQueuedCard(qc: QueuedCardState): CardObject {
   if (qc.cancelled) {
-    const els: CardElement[] = [noteMd('_⏹ 已取消排队_')];
+    const els: CardElement[] = [...voiceReplyElements(qc.voiceMessages), noteMd('_⏹ 已取消排队_')];
     if (qc.dropped) els.push(noteMd(`_⚠️ ${qc.dropped} 条排队消息已丢弃，请重发。_`));
     return card(els, { summary: '已取消排队' });
   }
   if (qc.started) return card([noteMd('_🎯 排队结束，目标已开始执行_')], { summary: '已开始执行' });
   const els: CardElement[] = [
+    ...voiceReplyElements(qc.voiceMessages),
     md(`⏳ 排队中（第 **${qc.position ?? 1}** 位）`),
     noteMd('全局并发池已满（所有群/话题共享），轮到后自动开始。'),
   ];

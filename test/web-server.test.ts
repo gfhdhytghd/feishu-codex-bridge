@@ -10,6 +10,8 @@ import { AdminWriteError } from '../src/admin/ops';
 // 内存 stub：server 层单测不碰真实文件/注册表（service 自有专门的集成测试）。
 function stubService(): AdminService {
   return {
+    async getVoice() { return { enabled: false, feishu: { state: 'unchecked' as const, message: '尚未检测' }, result: '尚未测试', grantUrl: 'https://open.feishu.cn/' }; },
+    async setVoice() {},
     async listBots() {
       return [
         {
@@ -843,4 +845,27 @@ describe('web server · 日志', () => {
     expect(buf).toContain('data: {"event":"second-line"}');
     ac.abort();
   }, 10_000);
+});
+
+describe('voice settings HTTP boundary', () => {
+  it('requires authentication even for voice status', async () => {
+    expect((await get('/api/bots/cli_a/voice')).status).toBe(401);
+  });
+  it('returns diagnostics without credentials', async () => {
+    const res = await authed('/api/bots/cli_a/voice');
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({ enabled: false });
+  });
+  it('accepts enable/test and never echoes submitted secrets', async () => {
+    for (const body of [{ action: 'enable' }, { action: 'test' }, { action: 'disable' }, { action: 'refreshPermission' }]) {
+      const res = await authed('/api/bots/cli_a/voice', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      expect(res.status).toBe(200); expect(await res.text()).not.toContain('private-key');
+    }
+  });
+  it('rejects removed provider configuration and unexpected operations before dispatch', async () => {
+    for (const body of [{ action: 'configureDoubao', credentials: {} }, { action: 'switchPlan', plan: 'free' }]) {
+      const res = await authed('/api/bots/cli_a/voice', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      expect(res.status).toBe(400);
+    }
+  });
 });
