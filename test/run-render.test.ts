@@ -103,10 +103,10 @@ describe('reduce', () => {
     ]);
     expect(s.terminal).toBe('running');
     expect(s.footer).toBe('retrying');
-    // the running layout survives: ⏹ stays, the retrying notice shows
-    const json = JSON.stringify(buildRunCard({ rs: s, cardKey: 'm1' }));
+    const card = buildRunCard({ rs: s, cardKey: 'm1' });
+    const json = JSON.stringify(card);
     expect(json).toContain('自动重试中');
-    expect(json).toContain('⏹ 终止');
+    expect(buttons(card)[0]).toMatchObject({ a: RC.stop, icon: 'stop-record_filled' });
     expect(json).not.toContain('agent 失败');
     // the retry succeeded → deltas overwrite the retrying footer
     const resumed = reduce(s, { type: 'text_delta', itemId: 'a', delta: ' again' });
@@ -160,14 +160,35 @@ describe('buildRunCard', () => {
   });
 });
 
-/** Collect every button's {label, action, msgId} from a built card. */
-function buttons(node: unknown, acc: { label: string; a: unknown; m: unknown }[] = []): { label: string; a: unknown; m: unknown }[] {
+interface RenderedButton {
+  label?: string;
+  a: unknown;
+  m: unknown;
+  type: unknown;
+  size: unknown;
+  width: unknown;
+  icon: unknown;
+  iconColor: unknown;
+  tooltip: unknown;
+}
+
+function buttons(node: unknown, acc: RenderedButton[] = []): RenderedButton[] {
   if (Array.isArray(node)) node.forEach((n) => buttons(n, acc));
   else if (node && typeof node === 'object') {
     const o = node as Record<string, any>;
     if (o.tag === 'button') {
       const value = o.behaviors?.[0]?.value ?? {};
-      acc.push({ label: o.text?.content, a: value.a, m: value.m });
+      acc.push({
+        label: o.text?.content,
+        a: value.a,
+        m: value.m,
+        type: o.type,
+        size: o.size,
+        width: o.width,
+        icon: o.icon?.token,
+        iconColor: o.icon?.color,
+        tooltip: o.hover_tips?.content,
+      });
     }
     for (const k of Object.keys(o)) buttons(o[k], acc);
   }
@@ -177,30 +198,56 @@ function buttons(node: unknown, acc: { label: string; a: unknown; m: unknown }[]
 describe('buildRunCard — goal controls', () => {
   const running = (): RunState => run([{ type: 'text_delta', itemId: 'a', delta: 'working…' }]);
 
-  it('renders BOTH 终止 and 结束目标 on a goal card, wired to the right actions', () => {
+  it('renders an icon-only blue outlined stop control beside 结束目标 with distinct actions', () => {
     const btns = buttons(buildRunCard({ rs: running(), cardKey: 'g1', goalControls: true }));
     expect(btns).toHaveLength(2);
     const stop = btns.find((b) => b.a === RC.stop);
     const end = btns.find((b) => b.a === RC.endGoal);
-    expect(stop).toMatchObject({ label: '⏹ 终止', m: 'g1' });
+    expect(stop).toMatchObject({
+      label: undefined,
+      m: 'g1',
+      type: 'primary',
+      size: 'medium',
+      width: 'default',
+      icon: 'stop-record_filled',
+      iconColor: 'blue',
+      tooltip: '立即停止并结束目标',
+    });
     expect(end).toMatchObject({ label: '🎯 结束目标', m: 'g1' });
   });
 
-  it('renders only ⏹ 终止 on a normal (non-goal) run card', () => {
+  it('renders an icon-only blue outlined stop control on an ordinary run card', () => {
     const btns = buttons(buildRunCard({ rs: running(), cardKey: 'm1' }));
     expect(btns).toHaveLength(1);
-    expect(btns[0]).toMatchObject({ label: '⏹ 终止', a: RC.stop });
+    expect(btns[0]).toEqual({
+      label: undefined,
+      a: RC.stop,
+      m: 'm1',
+      type: 'primary',
+      size: 'medium',
+      width: 'default',
+      icon: 'stop-record_filled',
+      iconColor: 'blue',
+      tooltip: '停止生成',
+    });
   });
 
   it('renders no controls without a cardKey (nothing to route to)', () => {
     expect(buttons(buildRunCard({ rs: running(), goalControls: true }))).toHaveLength(0);
   });
 
-  it('after 结束目标 (goalEnding): drops 结束目标, keeps ⏹ 终止, shows the notice', () => {
+  it('after 结束目标, keeps the icon-only stop control and shows the notice', () => {
     const card = buildRunCard({ rs: running(), cardKey: 'g1', goalControls: true, goalEnding: true });
     const btns = buttons(card);
     expect(btns).toHaveLength(1);
-    expect(btns[0]).toMatchObject({ label: '⏹ 终止', a: RC.stop });
+    expect(btns[0]).toMatchObject({
+      label: undefined,
+      a: RC.stop,
+      type: 'primary',
+      icon: 'stop-record_filled',
+      iconColor: 'blue',
+      tooltip: '停止生成',
+    });
     expect(JSON.stringify(card)).toContain('目标已解除');
   });
 });
@@ -254,7 +301,7 @@ describe('buildRunCard — terminal collapse', () => {
     expect(els.some((e) => e.tag === 'collapsible_panel')).toBe(true);
     expect(els.some((e) => e.tag === 'markdown' && e.content === 'partial ans')).toBe(true);
     expect(JSON.stringify(els)).toContain('已被中断');
-    expect(JSON.stringify(els)).not.toContain('终止');
+    expect(buttons(els).some((button) => button.a === RC.stop)).toBe(false);
   });
 
   it('folds process and shows the error note when the agent fails', () => {
@@ -320,14 +367,13 @@ describe('buildRunCard — full command visibility', () => {
     events.push({ type: 'done', turnId: 'x' });
     const card = buildRunCard({ rs: run(events) });
     const json = JSON.stringify(card);
-    // not degraded to a batched summary (the summary title says「N 个工具调用」;
-    // the process-fold header only says「N 个工具」) — and 1 fold + 5 tool panels.
+    // Every operation retains an independently expandable detail inside its group.
     expect(json).not.toContain('个工具调用');
-    expect(panelCount(card)).toBe(6);
+    expect(panelCount(card)).toBe(7); // process + consecutive-tool group + 5 details
     for (let i = 0; i < 5; i++) expect(json).toContain(`FULLCMD_TAIL_${i}`);
   });
 
-  it('degrades a huge run to a batched summary that STILL lists full commands (and never explodes the card)', () => {
+  it('keeps a large process inside the native panel without a separate viewer action', () => {
     const events: AgentEvent[] = [];
     const cmd0 = `run ${'a'.repeat(90)} BATCHED_TAIL`;
     for (let i = 0; i < 130; i++) {
@@ -338,10 +384,12 @@ describe('buildRunCard — full command visibility', () => {
     events.push({ type: 'done', turnId: 'x' });
     const card = buildRunCard({ rs: run(events) });
     const json = JSON.stringify(card);
-    expect(json).toContain('130 个工具调用'); // degraded to the summary (component budget)
-    expect(json).toContain('BATCHED_TAIL'); // ...but a batched command is still shown in full
-    // component-budget guard held: the card is a handful of panels, not 130
-    expect(panelCount(card)).toBeLessThan(10);
+    expect(json).not.toContain('run.process.');
+    expect(json).not.toContain('查看全部操作');
+    expect(json).toContain('BATCHED_TAIL');
+    for (let i = 1; i < 130; i++) expect(json).toContain(`cmd ${i}\\n`);
+    expect(json).not.toContain('项过程已省略（卡片容量限制）');
+    expect(Buffer.byteLength(json, 'utf8')).toBeLessThan(28000);
   });
 });
 

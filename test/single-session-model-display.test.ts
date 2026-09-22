@@ -99,7 +99,9 @@ beforeEach(() => {
   fake.backend.resumeThread.mockReset();
   fake.backend.startThread.mockReset();
 });
-afterEach(async () => { await orchestrator?.shutdown(); });
+afterEach(async () => {
+  await orchestrator?.shutdown();
+});
 const until = (check: () => void) => vi.waitFor(check);
 
 describe('single-session model display', () => {
