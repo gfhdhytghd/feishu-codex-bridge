@@ -297,3 +297,17 @@ it('rejects oversized mention takeover, releases every message and leaves the pr
   await vi.waitFor(()=>expect(fake.send.mock.calls.filter(call=>JSON.stringify(call).includes('分批'))).toHaveLength(2));
   expect(run.consumed).toHaveLength(0);
 });
+
+it('steers judged voice through the upstream live turn without creating a duplicate turn', async () => {
+  const run = thread(); fake.backend.resumeThread.mockResolvedValue(run.t);
+  const o = setup(); await o.onMessage(message('first'));
+  await until(() => expect(run.consumed).toHaveLength(1));
+  fake.action = 'STEER';
+  await o.onMessage({ ...message('[audio]'), mentionedBot: false, rawContentType: 'audio' });
+  await vi.waitFor(() => expect(run.t.steer).toHaveBeenCalledOnce(), { timeout: 3500 });
+  expect(run.t.steer.mock.calls[0]?.[0].text).toContain('转写后的请求');
+  expect(fake.transcribe).toHaveBeenCalledOnce();
+  run.turns[0]!.resolve();
+  await until(() => expect(fake.final).toHaveBeenCalled());
+  expect(run.consumed).toHaveLength(1);
+});

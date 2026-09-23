@@ -4,8 +4,6 @@ import { ingestVoice, createIntakeQueue, type IngestedContext } from '../voice/i
 import type { VoiceReply } from '../voice/types';
 import { assertDiscussDeliveryBudget, DiscussDeliveryBudgetError } from './discuss-delivery-budget';
 import { VoiceIntake } from './voice-intake';
-const messageHasVoice = (msg: NormalizedMessage): boolean => msg.rawContentType === 'audio' || Boolean(msg.resources?.some(r => r.type === 'audio'));
-class VoiceError extends Error {}
 import { steerWithDeadline, isRejectedSteer } from './steer-delivery';
 import { TurnCardEvents, type SteerCardEvent } from './turn-card-events';
 import { runSegment } from '../card/run-segment';
@@ -483,6 +481,9 @@ function runFailureMessage(err: unknown, dropped: number): string {
   return dropped > 0 ? `${error}\n\n⚠️ ${dropped} 条排队消息未执行，请重发。` : error;
 }
 
+const messageHasVoice = (msg: NormalizedMessage): boolean => msg.rawContentType === 'audio' || Boolean(msg.resources?.some(r => r.type === 'audio'));
+class VoiceError extends Error {}
+
 interface ActiveState {
   steerReply?: { run: AgentRun; accept: (messageId: string, voice?: VoiceReply) => boolean };
   /** Captured with the steer target so a late ACK cannot decorate another turn. */
@@ -721,14 +722,14 @@ export function createOrchestrator(
           if (await getSession(key)) return;
           guard();
           const be = backendFor(project?.backend);
-          const thread = await be.startThread({ cwd: project!.cwd, model: project?.defaultModel, effort: project?.defaultEffort,
+          const thread = await be.startThread({ cwd: project!.cwd, model: project?.defaultModel, effort: project?.defaultEffort, fastMode: project?.defaultFastMode,
             mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact, historyMode: 'legacy' });
           try { guard(); } catch (error) { await thread.close(); throw error; }
           trackSession(key, thread, true);
           const titleJobKey = await registerSessionTitle(be, thread.sessionId, project!.cwd);
           guard();
           await upsertSession({ threadId: key, chatId: msg.chatId, cwd: project!.cwd, sessionId: thread.sessionId,
-            backend: be.id, titleJobKey, model: project?.defaultModel, effort: project?.defaultEffort, summary: '', createdAt: Date.now(), updatedAt: Date.now() });
+            backend: be.id, titleJobKey, model: project?.defaultModel, effort: project?.defaultEffort, fastMode: project?.defaultFastMode, summary: '', createdAt: Date.now(), updatedAt: Date.now() });
         })();
         discussInitializers.set(key, init);
       }
@@ -785,15 +786,20 @@ export function createOrchestrator(
         log.warn('intake', 'discuss-delivery-over-budget', { key, bytes: Buffer.byteLength(text) });
         return false;
       }
-      if (messages.some(messageHasVoice)) {
-        startReservedRun(msg, text, key, true, project, perm, images, { text, voice: ingestedMessages.at(-1)?.voice }, msg.content, undefined, context.receipt);
-      } else if (action === 'STEER') {
+      if (action === 'STEER') {
         const state = active.get(key);
         if (!snapshot.runId || current.runId !== snapshot.runId || !state?.thread || !state.run) return false;
         // Uncertain transport failures remain unknown for history reconciliation.
         attemptedSteer = true;
         await steerWithDeadline(state.thread, { text, images }, snapshot.runId, context.receipt.signal);
         context.receipt.accepted(key, snapshot.hostId);
+        const voiceReply = state.voiceReply?.run === state.run ? state.voiceReply : undefined;
+        const steerReply = state.steerReply?.run === state.run ? state.steerReply : undefined;
+        for (const [i, message] of messages.entries()) {
+          const voice = ingestedMessages[i]?.voice;
+          const split = steerReply?.accept(message.messageId, voice);
+          if (!split && voice) voiceReply?.add(voice);
+        }
       } else {
         if (active.has(key)) return false;
         startReservedRun(msg, text, key, true, project, perm, images, { text, voice: ingestedMessages.at(-1)?.voice }, msg.content, undefined, context.receipt);
