@@ -121,12 +121,11 @@ function lexicallyInside(cwdAbs: string, abs: string): boolean {
   return rel !== '' && !rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel);
 }
 
-/** {@link lexicallyInside}, then once more on the symlink-resolved paths so a
+/** Check canonical paths, including symlink targets, so a
  * project reachable through two names (macOS `/tmp` → `/private/tmp`, a
  * symlinked home) doesn't false-reject a genuine in-workspace file. Best-effort:
  * a missing path just fails the retry. */
 async function insideWorkspace(cwdAbs: string, abs: string): Promise<boolean> {
-  if (lexicallyInside(cwdAbs, abs)) return true;
   try {
     return lexicallyInside(await realpath(cwdAbs), await realpath(abs));
   } catch {

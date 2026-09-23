@@ -35,6 +35,8 @@ export type PermissionMode = 'qa' | 'write' | 'full';
 export const DEFAULT_PERMISSION_MODE: PermissionMode = 'write';
 
 export interface AgentInput {
+  /** Bridge-only delivery receipt; never serialized into model input. */
+  contextReceipt?: { accepted(key?: string, hostId?: string): void; rejected(): void; settled: Promise<void>; signal?: AbortSignal };
   text?: string;
   /** absolute local paths of images the user sent — codex reads them directly as
    * `localImage`; the claude backend base64-encodes them into image blocks. */
@@ -207,6 +209,9 @@ export interface TurnOptions {
 }
 
 export interface AgentThread {
+  /** Read metadata without consuming notifications. Empty new threads have no rollout yet. */
+  forkContext?(): Promise<{ path?: string; empty: boolean; model?: string; effort?: ReasoningEffort }>;
+
   /** backend session id（codex 的 thread id，其它后端可能是 session UUID）——持久化进
    * SessionRecord.sessionId，重启后经 resumeThread 找回同一会话。 */
   readonly sessionId: string;
@@ -242,6 +247,8 @@ export interface AgentThread {
 }
 
 export interface StartThreadOptions {
+  /** Required by cross-process forks on Codex 0.154. */
+  historyMode?: 'legacy';
   cwd: string;
   model?: string;
   effort?: ReasoningEffort;

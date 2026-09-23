@@ -90,9 +90,43 @@ export interface AppAccess {
   allowedChats?: string[];
 }
 
+/** Optional local context command run before every accepted group turn. */
+export interface MemoryContextConfig {
+  enabled?: boolean;
+  /** Disable prompt injection independently of background archiving. */
+  inject?: boolean;
+  command: string;
+  args?: string[];
+  timeoutMs?: number;
+  maxOutputBytes?: number;
+  /** Optional background sync arguments, run by the already-authorized bridge process. */
+  syncArgs?: string[];
+  syncIntervalSeconds?: number;
+  syncTimeoutMs?: number;
+}
+
+export interface ResolvedMemoryContextConfig {
+  command: string;
+  args: string[];
+  timeoutMs: number;
+  maxOutputBytes: number;
+  syncArgs: string[];
+  syncIntervalMs: number;
+  syncTimeoutMs: number;
+}
+
 export interface AppPreferences {
   /** Opt-in Feishu ASR; unavailable recognition preserves the original audio. */
   voice?: import('../voice/types').VoiceConfig;
+  /** Question-conditioned, current-chat context. When explicitly disabled,
+   * separately configured memory injection remains available. */
+  contextBriefing?: {
+    enabled?: boolean;
+    model?: string;
+    timeoutMs?: number;
+    archivePath?: string;
+    pythonCommand?: string;
+  };
   /** 空白项目的默认父目录。仅通过 config.json 配置；缺省时仍使用
    * `~/.feishu-codex-bridge/projects`。支持绝对路径或 `~` 开头的路径。 */
   projectsRootDir?: string;
@@ -128,6 +162,8 @@ export interface AppPreferences {
   /** Bridge 新建聊天会话的 resume 标题配置。每个 agent 后端独立；
    * 缺省/未命中的后端不调模型，直接截断清洗后的首句。 */
   sessionTitles?: SessionTitlesConfig;
+  /** Local-first history retrieval. Fail-open: a broken command never blocks a turn. */
+  memoryContext?: MemoryContextConfig;
 }
 
 /** 开启 AI 的完整配置；不允许只填 model 或只填 effort。 */
@@ -204,6 +240,32 @@ export function getMessageReplyMode(cfg: AppConfig): MessageReplyMode {
   const raw = cfg.preferences?.messageReply;
   if (raw === 'card' || raw === 'markdown' || raw === 'text') return raw;
   return 'card';
+}
+
+export function getMemoryContextConfig(cfg: AppConfig): ResolvedMemoryContextConfig | undefined {
+  const raw = cfg.preferences?.memoryContext;
+  if (!raw || raw.enabled === false || typeof raw.command !== 'string' || !raw.command.trim()) return undefined;
+  return {
+    command: raw.command,
+    args: Array.isArray(raw.args) ? raw.args.filter((value): value is string => typeof value === 'string') : [],
+    timeoutMs:
+      typeof raw.timeoutMs === 'number' && Number.isFinite(raw.timeoutMs)
+        ? Math.min(10_000, Math.max(100, Math.floor(raw.timeoutMs)))
+        : 2_500,
+    maxOutputBytes:
+      typeof raw.maxOutputBytes === 'number' && Number.isFinite(raw.maxOutputBytes)
+        ? Math.min(256_000, Math.max(1_024, Math.floor(raw.maxOutputBytes)))
+        : 64_000,
+    syncArgs: Array.isArray(raw.syncArgs)
+      ? raw.syncArgs.filter((value): value is string => typeof value === 'string')
+      : [],
+    syncTimeoutMs: typeof raw.syncTimeoutMs === 'number' && Number.isFinite(raw.syncTimeoutMs)
+      ? Math.min(600_000, Math.max(100, Math.floor(raw.syncTimeoutMs))) : 60_000,
+    syncIntervalMs:
+      typeof raw.syncIntervalSeconds === 'number' && Number.isFinite(raw.syncIntervalSeconds)
+        ? Math.min(86_400, Math.max(60, Math.floor(raw.syncIntervalSeconds))) * 1_000
+        : 600_000,
+  };
 }
 
 export function getShowToolCalls(cfg: AppConfig): boolean {

@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -88,4 +88,13 @@ describe('uploadOutboundImages', () => {
     expect(map.has('gone.png')).toBe(false);
     expect(map.get('real.png')).toMatch(/^img_key_/);
   });
+});
+
+it.each(['qa', 'write'] as const)('rejects an in-workspace symlink pointing outside in %s mode', async mode => {
+  const cwd = await tmpDir(); const outside = await tmpDir();
+  await writeFile(join(outside, 'private.png'), PNG);
+  await symlink(join(outside, 'private.png'), join(cwd, 'link.png'));
+  const { channel, state } = fakeChannel();
+  expect((await uploadOutboundImages(channel, ['link.png'], cwd, mode)).size).toBe(0);
+  expect(state.calls).toBe(0);
 });
